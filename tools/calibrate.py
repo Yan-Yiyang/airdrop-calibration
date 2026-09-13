@@ -26,10 +26,12 @@ FlightRecorder 的标准飞行目录）。
 
 已知边界（写在这里免得被当成 bug）
 ----------------------------------
-* ``t_bc``（杆臂）在手持采集下**估不出来**：``(R_a − I)t_x = R_x t_b − t_a`` 里的
-  ``t_a`` 只能来自遥测位置，而室内无 GPS 时它不可信。因此默认**不估平移**
-  （``use_body_translation=False``，解出的 ``t_bc`` 为 None），
-  按计划"旋转以标定为准、平移以尺量为准"，把尺量值 :data:`MEASURED_T_BC` 写进结果。
+* ``t_bc``（杆臂）在手持采集下**估不准**：``(R_a − I)t_x = R_x t_b − t_a`` 里的
+  ``t_a`` 只能来自遥测位置，而室内无 GPS 时它不可信。所以按计划"旋转以标定为准、
+  平移以尺量为准"：标定文件里的 ``t_bc`` 写尺量值 :data:`MEASURED_T_BC`，
+  估计值（:func:`solve_hand_eye` 的平移分支）照算，但只写进 ``meta`` 供**对比校验**
+  ——两者应当同量级、逐轴接近；差得离谱正是"遥测位置不可用"的直接证据
+  （:func:`run_extrinsics` 同时给出残差判据与 ``estimated_reliable``）。
 * 互相关只能分辨到采样间隔量级；要更高精度需要 Kalibr 式样条联合优化（计划列为
   可选增强，未进首版）。
 * **``cv2.calibrateHandEye`` 在 Python 里不可用，但原因不是"被移除"**：
@@ -86,8 +88,12 @@ MIN_PAIR_ROTATION_DEG = 5.0
 MIN_AXIS_SPREAD_DEG = 15.0
 #: 参与解算的运动对上限（全对是 O(n²)；按固定步长抽样，保证确定性）
 MAX_MOTION_PAIRS = 2000
-#: 尺量杆臂（米），作为 t_bc 的推荐值（手持标定估不准平移）
+#: 尺量杆臂（米），标定文件里的 t_bc 就用它（手持标定估不准平移）
 MEASURED_T_BC = (0.0, 0.0, 0.0)
+#: 杆臂**估计值**可采信的判据：平移方程残差（米）≤ max(下限, 该比例 × 画面平移跨度)。
+#: ``t_a`` 是真是假都解得出一个 ``t_x``，区别在残差——所以判据必须落在残差上。
+LEVER_ARM_RESIDUAL_RATIO = 0.05
+LEVER_ARM_RESIDUAL_FLOOR_M = 0.02
 
 
 # ----------------------------------------------------------------------
@@ -123,13 +129,22 @@ class LagResult:
 @dataclass
 class ExtrinsicsResult:
     r_bc: np.ndarray
-    #: 相机光心在机体系的位置（杆臂）。默认**不估**（遥测位置不可信）时为 None
+    #: 相机光心在机体系的位置（杆臂）**估计值**。手持采集时遥测位置不可信，这个值
+    #: **只用于与尺量值对比校验**，能否采信看 :attr:`t_bc_reliable`；
+    #: 写进标定文件的 ``t_bc`` 始终是尺量值
     t_bc: np.ndarray | None
     pairs: int
     residual_rotation_deg: float
     #: 相对旋转轴的最大张角（度），用来判断激励是否只绕一根轴
     axis_spread_deg: float = 0.0
+    #: 杆臂估计是否可采信（平移方程自洽），判据见 :func:`run_extrinsics`
     t_bc_reliable: bool = False
+    #: 平移方程 ``(R_a−I)t_x + t_a − R_x t_b`` 的最大残差（米）
+    residual_translation_m: float = float("nan")
+    #: 遥测位置跨度（米，包围盒对角线）——与实际运动量对比即可看出遥测位置是否可用
+    body_span_m: float = 0.0
+    #: 画面（PnP）位置跨度（米）
+    camera_span_m: float = 0.0
     methods: dict[str, float] = field(default_factory=dict)   # 方法名 → 残差（度）
 
     @property
@@ -755,8 +770,9 @@ def solve_hand_eye(
     ----
     ``R_a t_x + t_a = R_x t_b + t_x`` ⇒ ``(R_a − I) t_x = R_x t_b − t_a``。
     注意它**必须用到 ``t_a``**，也就是遥测位置。室内手持采集没有 GPS，``t_a`` 不可信，
-    所以默认 ``use_translation=False``：此时返回 ``t_x = None``，**不要**假装能估出杆臂
-    （计划里杆臂本来就走尺量）。
+    所以 ``t_x`` 在本项目里**只当校验用**：标定文件的杆臂是尺量值，这里算出来的估计值
+    与它对比（差得离谱 ⇒ 遥测位置不可用）。能否采信由 :func:`run_extrinsics` 的残差
+    判据决定——``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来。
 
     返回 ``(R_x, t_x | None, 相对奇异值, 旋转轴张角(度))``。
     相对奇异值 ``s[-1]/s[0]`` 越接近 0 说明运动激励越充分（绝对值随量纲变化，只有相对量可比）。
@@ -813,6 +829,44 @@ def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
             cosine = abs(float(np.dot(first, second))) / norm
             spread = max(spread, math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
     return spread
+
+
+def _translation_span(poses: Sequence[np.ndarray]) -> float:
+    """一组位姿的位置跨度（米）：三轴极差组成的包围盒对角线。
+
+    用来把"遥测说机体动了多少"和"PnP 说相机动了多少"并排看——两者本该同量级
+    （只差一个杆臂随姿态转动带来的小量），差一个数量级就是遥测位置不可用的铁证。
+    """
+    if not poses:
+        return 0.0
+    points = np.asarray([pose[:3, 3] for pose in poses], dtype=np.float64)
+    return float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+
+
+def _translation_residual(
+    a_list: Sequence[np.ndarray],
+    b_list: Sequence[np.ndarray],
+    rotation: np.ndarray,
+    translation: np.ndarray | None,
+) -> float:
+    """平移方程 ``(R_a − I)t_x + t_a − R_x t_b`` 的最大残差（米）。
+
+    这是判"遥测位置能不能用"的关键量。``t_a`` 是真是假都解得出一个 ``t_x``
+    （最小二乘照样给你一个数），但假 ``t_a`` 会让方程**本身不自洽**：残差涨到与真实
+    位移同量级。所以别只看 ``t_x`` 的大小，要看这个残差。
+    """
+    if translation is None:
+        return float("nan")
+    identity = np.eye(3)
+    worst = 0.0
+    for a_matrix, b_matrix in zip(a_list, b_list):
+        offset = (
+            (a_matrix[:3, :3] - identity) @ translation
+            + a_matrix[:3, 3]
+            - rotation @ b_matrix[:3, 3]
+        )
+        worst = max(worst, float(np.linalg.norm(offset)))
+    return worst
 
 
 def relative_transform(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -938,7 +992,7 @@ def run_extrinsics(
     body_poses: Sequence[np.ndarray],
     min_pair_rotation_deg: float = MIN_PAIR_ROTATION_DEG,
     min_axis_spread_deg: float = MIN_AXIS_SPREAD_DEG,
-    use_body_translation: bool = False,
+    estimate_body_translation: bool = True,
     max_pairs: int = MAX_MOTION_PAIRS,
 ) -> ExtrinsicsResult:
     """手眼标定：``board_poses`` 与 ``body_poses`` 必须**逐项同时刻**。
@@ -952,6 +1006,15 @@ def run_extrinsics(
 
     运动对取所有 ``i < j``（超过 ``max_pairs`` 时按固定步长抽样，保证结果确定），
     ``A`` 用遥测相对运动、``B`` 用 PnP 相对运动；方程与解法见 :func:`solve_hand_eye`。
+
+    平移（杆臂）**照算，但只当校验用**
+    ----------------------------------
+    ``estimate_body_translation=True``（默认）会连 ``t_bc`` 一起解出来——它需要遥测位置
+    ``t_a``，室内手持无 GPS 时不可信，所以这个估计值**不进标定文件**，只用于和尺量值
+    对表。可采信与否交给残差判据：``t_bc_reliable`` 要求平移方程残差
+    ≤ ``max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度)``。
+    理由是``t_a`` 是真是假**都**解得出一个 ``t_x``（最小二乘照样给数），假 ``t_a``
+    表现在方程不自洽、残差涨到与真实位移同量级，所以判据必须落在残差上。
     """
     if len(board_poses) != len(body_poses):
         raise ValueError(
@@ -990,7 +1053,7 @@ def run_extrinsics(
             "都转起来（俯仰/横滚/偏航），全程只平移是解不出来的"
         )
     rotation, translation, relative_sv, axis_spread = solve_hand_eye(
-        a_list, b_list, use_translation=use_body_translation
+        a_list, b_list, use_translation=estimate_body_translation
     )
     if axis_spread < min_axis_spread_deg:
         raise ValueError(
@@ -1004,15 +1067,82 @@ def run_extrinsics(
         for a_matrix, b_matrix in zip(a_list[:50], b_list[:50])
     ]
     mean_residual = float(np.mean(residuals)) if residuals else float("nan")
+    body_span = _translation_span(body_poses)
+    camera_span = _translation_span(camera_pose)
+    translation_residual = _translation_residual(a_list, b_list, rotation, translation)
+    tolerance = lever_arm_tolerance(camera_span)
     return ExtrinsicsResult(
         r_bc=rotation,
         t_bc=translation,
         pairs=len(a_list),
         residual_rotation_deg=mean_residual,
         axis_spread_deg=axis_spread,
-        t_bc_reliable=translation is not None,
+        t_bc_reliable=translation is not None and translation_residual <= tolerance,
+        residual_translation_m=translation_residual,
+        body_span_m=body_span,
+        camera_span_m=camera_span,
         methods={"horaud": mean_residual, "relative_singular": relative_sv},
     )
+
+
+def lever_arm_tolerance(camera_span_m: float) -> float:
+    """杆臂**估计值**的采信门限（米）：平移残差不超过它才算可信。
+
+    门限随实际运动量放大（``LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度``），因为残差本身
+    是"米"，与动得多少直接相关；动得很小时用 ``LEVER_ARM_RESIDUAL_FLOOR_M`` 兜底。
+    """
+    return max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO * camera_span_m)
+
+
+def lever_arm_report(
+    result: ExtrinsicsResult | None,
+    measured: Sequence[float] | None = None,
+) -> dict[str, Any]:
+    """杆臂记录：**以尺量为准**，同时给出标定估计值供对比校验。
+
+    估计值来自 :func:`solve_hand_eye` 的平移分支，需要遥测位置 ``t_a``；室内手持采集
+    没有 GPS 时它不可信，所以估计值**不进**标定结果的 ``t_bc`` 字段（georef 读的是尺量
+    值），只写进 ``meta`` 供人核对：两者应当同量级、逐轴接近，``delta_m`` 是欧氏距离。
+    差得离谱正是"遥测位置不可用"的证据——此时 ``estimated_reliable`` 也会是 False。
+
+    ``measured=None`` 时取 :data:`MEASURED_T_BC`——**在调用时取**，不是定义时绑定：
+    那个常量是给人改的，写进默认参数会让"改了常量、报告里还是旧值"。
+    """
+    measured_list = [
+        float(value)
+        for value in (MEASURED_T_BC if measured is None else measured)
+    ]
+    report: dict[str, Any] = {
+        "authoritative": measured_list,
+        "source": "measured",
+        "estimated": None,
+        "delta_xyz_m": None,
+        "delta_m": None,
+        "estimated_reliable": False,
+        "residual_translation_m": None,
+        "residual_tolerance_m": None,
+        "body_span_m": None,
+        "camera_span_m": None,
+        "note": (
+            "t_bc 以尺量为准（手持采集时遥测位置不可信）；"
+            "estimated 仅供对比校验，估计值与尺量值差得离谱即说明遥测位置不可用"
+        ),
+    }
+    if result is None or result.t_bc is None:
+        return report
+    estimated = np.asarray(result.t_bc, dtype=np.float64).reshape(3)
+    delta = estimated - np.asarray(measured_list, dtype=np.float64)
+    report.update(
+        estimated=estimated.tolist(),
+        delta_xyz_m=[float(value) for value in delta],
+        delta_m=float(np.linalg.norm(delta)),
+        estimated_reliable=bool(result.t_bc_reliable),
+        residual_translation_m=float(result.residual_translation_m),
+        residual_tolerance_m=lever_arm_tolerance(result.camera_span_m),
+        body_span_m=float(result.body_span_m),
+        camera_span_m=float(result.camera_span_m),
+    )
+    return report
 
 
 def _pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
@@ -1178,7 +1308,33 @@ def calibrate(
                 extrinsics.pairs, extrinsics.residual_rotation_deg,
                 extrinsics.axis_spread_deg,
             )
-            LOGGER.info("  杆臂按尺量: t_bc=%s", list(MEASURED_T_BC))
+            # 杆臂：**尺量为准**（写进标定文件的是它），标定估计值只用来对表
+            arm = lever_arm_report(extrinsics)
+            if arm["estimated"] is None:
+                LOGGER.info("  杆臂按尺量: t_bc=%s（未估）", list(MEASURED_T_BC))
+            else:
+                LOGGER.info(
+                    "  杆臂：尺量 %s，标定估计 %s，差 %.3f m",
+                    [round(value, 4) for value in arm["authoritative"]],
+                    [round(value, 4) for value in arm["estimated"]],
+                    arm["delta_m"],
+                )
+                if arm["estimated_reliable"]:
+                    LOGGER.info(
+                        "  估计值可采信（平移残差 %.4f m 在 %.4f m 以内；"
+                        "遥测位置跨度 %.2f m vs 画面 %.2f m）",
+                        arm["residual_translation_m"], arm["residual_tolerance_m"],
+                        arm["body_span_m"], arm["camera_span_m"],
+                    )
+                else:
+                    LOGGER.warning(
+                        "  估计值**不可信**（平移残差 %.4f m 超出 %.4f m；遥测位置跨度 "
+                        "%.2f m vs 画面 %.2f m）——室内手持无 GPS 时遥测位置不可用，"
+                        "以尺量值 %s 为准；两者差得离谱正是这个原因",
+                        arm["residual_translation_m"], arm["residual_tolerance_m"],
+                        arm["body_span_m"], arm["camera_span_m"],
+                        list(MEASURED_T_BC),
+                    )
         except ValueError as exc:
             LOGGER.warning("  手眼标定失败: %s", exc)
     else:
@@ -1214,16 +1370,12 @@ def calibrate(
                     "pairs": extrinsics.pairs,
                     "residual_rotation_deg": extrinsics.residual_rotation_deg,
                     "axis_spread_deg": extrinsics.axis_spread_deg,
-                    "t_bc_estimated": (
-                        extrinsics.t_bc.tolist()
-                        if extrinsics.t_bc is not None
-                        else None
-                    ),
                     "t_bc_source": "measured",
+                    "lever_arm": lever_arm_report(extrinsics),
                     "methods": extrinsics.methods,
                     "note": (
-                        "R_bc 以手眼标定为准；t_bc 以尺量为准——"
-                        "手持采集时遥测位置不可信，杆臂估不出来"
+                        "R_bc 以手眼标定为准；t_bc 以尺量为准——手持采集时遥测位置不可信，"
+                        "标定给出的杆臂估计值只用于与尺量值对比校验"
                     ),
                 }
                 if extrinsics is not None
