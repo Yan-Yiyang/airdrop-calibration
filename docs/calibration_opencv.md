@@ -1,26 +1,26 @@
-# 标定与 OpenCV 5.0 踩坑（`tools/calibrate.py`）
+# 标定与 OpenCV 5.0 易错点（`tools/calibrate.py`）
 
-这份讲什么：三步标定流水线（内参 → 画面/遥测时间差 → 手眼外参）的实测结论，以及围绕
-OpenCV 5.0 的全部踩坑与判据。动标定、改 `georef` 外参、或怀疑"某个 cv2 函数没了"时读它。
+本文档说明：三步标定流水线（内参 → 画面/遥测时间差 → 手眼外参）的实测结论，以及围绕
+OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外参、或怀疑"某个 cv2 函数没了"时请先阅读本文档。
 **内容逐字搬自 `AGENTS.md` 的"工程缺口"（P6 下半那一节），与 AGENTS.md 同等权威。**
 
 ---
 
 - **`tools/calibrate.py`（P6 下半）= 三步标定流水线，已落地**（内参 → 画面/遥测时间差 →
   手眼外参）。采集方式：**棋盘格固定、手持飞机在其上方平移+旋转**（"板子不动、飞机在动"）。
-  35 个用例全绿（`tests/test_calibrate.py`），含**整个 `calibrate()` 跑通**的输出契约用例：
+  35 个用例全部通过（`tests/test_calibrate.py`），含**整个 `calibrate()` 跑通**的输出契约用例：
   手写一个标定飞行目录（渲染棋盘格帧 + 与真值外参自洽的遥测，遥测首末各多写一条把帧区间
   包住——`telemetry_pose_at` 拒绝外推）→ 断言 JSON 里 `t_bc` 恒为尺量值、估计值与差值进
   `meta.lever_arm`。实测这条链路：内参 RMS 0.055 px（fx 901.1 / 真值 900）、Δt≈0、
   430 个运动对、旋转残差 0.215°，杆臂估计 `[0.0584,-0.0315,0.0836]`（真值
   `[0.06,-0.03,0.09]`，差 3 mm）。
   它用的临时目录是工作区内的 `.calibrate-test-tmp`（**不用 `tmp_path`**，理由见 `AGENTS.md` 的"验证方式"）。
-  - **OpenCV 相关问题的三类分因（别一股脑赖 `CV_EXPORTS_W`）**：
+  - **OpenCV 相关问题的三类分因（不要一概归因于 `CV_EXPORTS_W`）**：
     **(a) 绑定标记丢失**——症状**只有一种**："`cv2` 里没有这个属性"。全库扫过 5.0 之后
     带 `bug` + `category: python bindings` 的 issue，只有两个手眼函数属于此类（见下）；
     **(b) 5.0 的行为/位置变更**——函数在，但类型、模块或后端拆分变了：FFmpeg 后端拆成
     插件 DLL（见 [`video_hm30_ffmpeg.md`](video_hm30_ffmpeg.md)）、`VideoCapture::get()` 不支持时返回 −1、DNN 换引擎；
-    **(c) 一直如此的老规矩、被我们误记成"5.0 变了"**——如 `calibrateCamera` 只收 float32、
+    **(c) 一直沿用的既有约定、被我们误记成"5.0 变了"**——如 `calibrateCamera` 只收 float32、
     `moments` 不收 float64。**(b)(c) 两类都不会表现为"属性消失"，别混为一谈。**
   - **`cv2.calibrateHandEye` 在 Python 侧不可用，但原因不是"被移除"**：OpenCV 5.0 把
     `calib3d` 拆成 `geometry`/`calib`/`stereo`/`ptcloud`，函数搬进 `modules/calib`，
@@ -29,7 +29,7 @@ OpenCV 5.0 的全部踩坑与判据。动标定、改 `georef` 外参、或怀�
     侧没生成。旁证：`cv2/__init__.pyi`（343 KB 权威桩）里 `CALIB_HAND_EYE_*` /
     `HandEyeCalibrationMethod` / `RobotWorldHandEyeCalibrationMethod` 都在，唯独没有函数。
     `opencv-contrib-python` **解决不了**（contrib 用同一份主仓源码，一样没有 `_W`），
-    装了还会扰动 torch/ultralytics——**别装**。第三步是自己实现的 `solve_hand_eye`。
+    装了还会扰动 torch/ultralytics——**不要安装**。第三步是自己实现的 `solve_hand_eye`。
     - **这是 OpenCV 官方承认的 bug，已修但还没进 wheel**（2026-09 查证）：
       报告 [issue #29565](https://github.com/opencv/opencv/issues/29565)
       "calibrateHandEye is missing in python package for version 5.0.0.93"
@@ -59,11 +59,11 @@ OpenCV 5.0 的全部踩坑与判据。动标定、改 `georef` 外参、或怀�
     1. **构造方向**：`G = P⁻¹X⁻¹` 时 `max|AX−XB| = 6.7e-16`、解到机器精度；
        写成 `G = P⁻¹X` 则 `max|AX−XB| = 0.95`（两种构造互为反向方程，极易搞混）。
     2. **零空间符号**：`vec(R)` 与 `vec(−R)` 是同一旋转，但 `det(−R) = −1`。
-       若不做"按行列式整体取反"就喂给"翻转最小奇异值"式正交化，会得到
+       若不做"按行列式整体取反"就送入"翻转最小奇异值"式正交化，会得到
        `R·diag(−1,−1,1)`——**精确差 180°**，而且**时对时错**（取决于 SVD 符号）。
        症状：零空间确实一维、真值确实在里面（`sv[-2:] = [4.17, 0.0]`），解出来却是 180°。
        回归用例跑了 5 组种子正是为了钉住这个"50% 概率"的 bug。
-  - **PnP 侧三个坑（都会给出"重投影漂亮但位姿差 180°"的结果）**：
+  - **PnP 侧三个易错点（都会给出"重投影残差很小但位姿差 180°"的结果）**：
     - `render_board` 的 `to_board` 必须减一个 `tile`：棋盘格第一个**内角点**在模板像素
       `(tile, tile)` 处，不是 `(0,0)`。少了这个偏移，渲染出的棋盘格整体错**一整格**，
       检测角点落在"板子真实点 +1 格"处（实测正面视图误差 248 px、姿态精确差 180°，
@@ -71,18 +71,18 @@ OpenCV 5.0 的全部踩坑与判据。动标定、改 `georef` 外参、或怀�
     - **棋盘格的标签二义性无解**：绕板面法向转 180° 后图像**完全一样**，两种"哪个角点是
       0 号"的分配都能拟合到亚像素，**方格相位也都是 1.000**（实测）——单帧图像里没有
       任何信息能定支。好在两支位姿只差一个**常量右乘**，`B'_ij = P'_jP'_i⁻¹ = B_ij`，
-      **只要全局同一支，`AX=XB` 的解一模一样；混用才崩**（残差几十度）。
-      `solve_board_poses` 用**相邻帧连续性**（与上一帧夹角最小）定支，别退回裸 `solvePnP`。
+      **只要全局同一支，`AX=XB` 的解完全相同；混用才会失败**（残差几十度）。
+      `solve_board_poses` 用**相邻帧连续性**（与上一帧夹角最小）定支，不要退回直接使用 `solvePnP`。
     - `_base_look_down_pose` 的图像 `v` 轴必须与板子 `+y` **同向**：反过来合成图成了镜像，
       角点标签整体反序（实测 4 个视图全差 180°）。另外 `look_at_board` 的扰动必须
-      **旋转矩阵右乘**，不能加在旋转向量上（`|rvec|` 接近 π 时"向量相加"会乱跳）。
+      **旋转矩阵右乘**，不能加在旋转向量上（`|rvec|` 接近 π 时"向量相加"会剧烈跳变）。
   - **`calibrateCamera` 只收 float32——这不是 5.0 的变化**：实测 objectPoints/imagePoints
     任一为 float64 都抛 `objectPoints should contain vector of vectors of points of type
     Point3f`；查 4.x 源码（PR #13803 的 diff，`modules/calib3d/src/calibration.cpp`）里
     写的是同样的 `checkVector(3, CV_32F)`，所以 4.x 也收不了 float64。
-    真正踩到的坑在**我们自己**：`detect_corners` 的 SB 路径返回 float64，
+    真正的问题出在**我们自己**的代码：`detect_corners` 的 SB 路径返回 float64，
     `run_intrinsics` 必须显式转 float32，否则内参这步直接失败
-    （`solvePnP` 则 float32/float64 都收；`moments` 也是老规矩，只收 int32/int64/float32）。
+    （`solvePnP` 则 float32/float64 都收；`moments` 同属此类既有约定，只收 int32/int64/float32）。
   - **杆臂 `t_bc` 以尺量为准，标定估计值只用于对比校验**：
     `(R_a − I)t_x = R_x t_b − t_a` 需要 `t_a`（遥测位置），室内手持没有 GPS，不可信。
     所以标定文件里的 `t_bc` **恒**为文件顶部的尺量常量 `MEASURED_T_BC`（georef 读的就是
@@ -118,7 +118,7 @@ OpenCV 5.0 的全部踩坑与判据。动标定、改 `georef` 外参、或怀�
   - **棋盘格渲染**：必须"深底 + 亮格"标准极性，且**模板四周不留边距**——留边距会让
     背景与边格同色、棋盘边界不可辨，`findChessboardCorners` 直接检不出
     （而 `checkChessboard` 仍返回 True，很容易误判成"几何没问题"）。
-  - **`cv2.Rodrigues` 的约定踩过两次坑**：它收的是世界→相机（相机轴作**行**）；
+  - **`cv2.Rodrigues` 的约定遇到过两次问题**：它收的是世界→相机（相机轴作**行**）；
     与其手推旋转矩阵，不如"构造已知投影 + `solvePnP` 反解"更可靠。
   - **不要再试**（都试过、都失败）：靠方格相位区分正序/反序标签；把 `A` 写成
     "棋盘格相对机体"的相对运动（那等于用 `X` 自身构造 `A`，`A ≡ B`，真值不在解空间里）；
