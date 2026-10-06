@@ -11,7 +11,8 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
   35 个用例全部通过（`tests/test_calibrate.py`），含**整个 `calibrate()` 跑通**的输出契约用例：
   手写一个标定飞行目录（渲染棋盘格帧 + 与真值外参自洽的遥测，遥测首末各多写一条把帧区间
   包住——`telemetry_pose_at` 拒绝外推）→ 断言 JSON 里 `t_bc` 恒为尺量值、估计值与差值进
-  `meta.lever_arm`。实测这条链路：内参 RMS 0.055 px（fx 901.1 / 真值 900）、Δt≈0、
+  `meta.lever_arm`。实测这条链路：内参 RMS 0.055 px（fx 901.1 / 真值 900）、
+  Δt≈0.15 s（= 素材里注入的视频链路延时；第 2 步走 received 收到时刻，给的是绝对对齐量）、
   430 个运动对、旋转残差 0.215°，杆臂估计 `[0.0584,-0.0315,0.0836]`（真值
   `[0.06,-0.03,0.09]`，差 3 mm）。
   它用的临时目录是工作区内的 `.calibrate-test-tmp`（**不用 `tmp_path`**，理由见 `AGENTS.md` 的"验证方式"）。
@@ -88,16 +89,47 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
     所以标定文件里的 `t_bc` **恒**为文件顶部的尺量常量 `MEASURED_T_BC`（georef 读的就是
     它），估计值（`estimate_body_translation=True`，默认开）连同"与尺量值差多少"一起写进
     `meta.extrinsics.lever_arm` 供人核对——两者应当同量级、逐轴接近。
-    - **判据落在残差上，不在数值大小上**：`t_a` 是真是假**都**解得出一个 `t_x`
-      （最小二乘照样给数），假 `t_a` 的表现是**方程自身不自洽**。所以
-      `t_bc_reliable` 要求平移方程残差 `residual_translation_m` ≤
-      `max(0.02 m, 0.05 × 画面平移跨度)`（`lever_arm_tolerance`）。
-      实测合成对照：遥测位置真 → 残差 `4e-14`、估计回到真值；把位置**置零**
-      （无 GPS 的典型表现）→ 残差 **1.81 m**、估计偏 **0.125 m**（比杆臂本身还大），
-      而**旋转解不受任何影响**（实测误差 `1.2e-6°`，因为 `A` 的旋转块与位置无关）。
-      诊断量 `body_span_m`（遥测位置跨度）vs `camera_span_m`（PnP 位置跨度）直接给出原因：
-      同一组数据里是 `0.00 m` vs `1.84 m`。回归用例
-      `test_extrinsics_flags_lever_arm_estimate_from_fake_telemetry_positions` 钉住。
+    - **判据有两条**（`t_bc_reliable`）：
+      1. **残差自洽**：平移方程残差 `residual_translation_m` ≤
+         `max(0.02 m, 0.05 × 画面平移跨度)`（`lever_arm_tolerance`）。`t_a` 是真是假**都**
+         解得出一个 `t_x`（最小二乘照样给数），假 `t_a` 常常表现为**方程自身不自洽**。
+         实测（位置与姿态**独立**抽样、尺度 0.3 m 的几何）：位置真 → 残差 `1e-15`；
+         位置置零 → 残差 **1.03–2.34 m**、判为不可信（5/5）。
+         ⚠ **但残差不是充分判据**：残差是右端项在 `A = stack(R_a − I)` 列空间**正交补**上的
+         投影，而"遥测位置恒零/几乎不动"带来的扰动 `Δt_a` 可能**整体落在列空间里**。
+         实测（本机合成采集几何：板子固定、相机原地转，即 `look_at_board` 的默认行为、
+         也是项目端到端合成标定飞行的几何——它满足 `p_k = c + R_k v`）：置零前后
+         **逐对残差最大差 2e-17 m**（一位不变），`t_x` 却偏 `|v| = 0.664 m`，判据照样说"可信"。
+      2. **量纲合格**（`telemetry_span_ok`）：遥测位置跨度 ≥ `BODY_SPAN_FLOOR_M = 0.01 m`，
+         且 `body_span_m / camera_span_m ∈ [0.1, 10]`（两边本该同量级；画面跨度为 0 =
+         没有平移可比对，也判不合格）。回归用例
+         `test_extrinsics_flags_zeroed_telemetry_even_though_residual_is_clean` 与
+         `test_extrinsics_flags_lever_arm_when_telemetry_barely_moves` 钉住。
+         它是**勤勉性检查、不是证明**：只能抓"位置恒零/几乎不动"与"两边差一个数量级"，
+         验证不了"位置偏了一半"这种中间态；采不到可信位置就重采，或者只用手眼旋转解。
+      **旋转解不受任何影响**（实测误差 `1.2e-6°`，因为 `A` 的旋转块与位置无关）。
+      ⚠ 画面跨度在"真值位姿"下可能**恰好为 0**（相机原地转）——gate 会判不合格，这是刻意的保守。
+    - **平移分支必须是堆叠最小二乘**（2026-10 修）：`(R_a − I)t_x = R_x t_b − t_a` 现在是
+      **堆叠**成 `(3n×3)` 后 `lstsq`（等价于法方程 `AᵀA t = Aᵀb`）。曾经写成"把各对方程
+      逐行相加再解 3×3"，那等于给每对**等权**：旋转角小的对几乎不提供信息、却把噪声全额
+      带进平均。实测同一批数据上逐行相加的杆臂误差中位大 **1.4–3.5 倍**；而堆叠解与 cv2
+      `calibrateHandEye` 的 **PARK** 方法在**同一个旋转解**下**逐位相同**（差 `3.4e-16 m`）。
+      回归用例 `test_translation_branch_is_stacked_least_squares` 钉住（无噪声数据下两种写法
+      都给真值、分辨不出，用例里专门加了确定性 PnP 扰动）。
+  - **手眼解已用旧版 OpenCV 官方实现交叉验证过**（2026-10，一次性验证、脚本不进仓库）：
+    隔离装 `opencv-python 4.10.0.84` / `4.14.0.94`（5.0 的 Python 侧没有 `calibrateHandEye`），
+    把**同一批绝对位姿**喂给 `cv2.calibrateHandEye` 的 5 种方法与 `solve_hand_eye`：
+    * 无噪声数据：两边都解到真值，最大旋转偏差 ≤ `2.1e-06°`、最大平移偏差 ≤ `7.1e-16 m`；
+      把 `(G, P)` 对调后误差稳定变成 **90.109°**（说明对拍对约定敏感，不是"怎么喂都对"）；
+    * 全链路（渲染 → JPEG → 检测 → 内参 → PnP）：本项目旋转误差中位 **0.075°**，
+      与 cv2 最好的 PARK/HORAUD **同级**；TSAI `0.084°`、DANIILIDIS `0.085°`；
+    * 角点噪声 σ=1.0 px：`1.416°` vs cv2 `1.417°`，同级；位姿数 20–30 个就够（`0.3°`）；
+    * ⚠ **cv2 的 ANDREFF 在正常口径数据上 0 行有解**（`(-7:Iterations do not converge)
+      Rotation normaliz…`，只在无噪声 `exact` 与部分 `attitude_noise` 行成功）——自研解没有
+      这个失效模式；退化激励（全绕单轴）下本项目**显式报错**，而官方 TSAI/HORAUD 会给出
+      ~90° 的错误解、DANIILIDIS 平移差 0.32 m（都不报错）；
+    * 两个 4.x 版本结果一致到 `2.4e-11°`。本机产物：`.handeye-verify/`（已 gitignore：
+      报告 `REPORT.md`、三阶段脚本、诊断探针、独立复核脚本）。
     - `estimate_body_translation=False` 时 `t_bc=None`、`t_bc_reliable=False`（老行为保留）。
     - **`lever_arm_report` 的 `measured` 默认值必须是 `None` 而不是 `= MEASURED_T_BC`**：
       后者是**定义时绑定**，用户改了文件顶部常量后，payload 里的 `t_bc`（运行时读取）会变、
@@ -105,16 +137,40 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
   - **配对不能按索引**：遥测 10 Hz、画面 30 Hz，"第 i 条遥测配第 i 帧"是错的。
     用 `align_body_poses` 按帧时刻重采样（位置线性内插、姿态 slerp，范围内才内插）。
     `lag_s` 的符号：`estimate_lag_by_correlation` 的 `lag > 0` 表示"画面滞后"，
-    即该帧内容对应的真实时刻比 `capture_timestamp` **早** `lag` 秒 ⇒ 查遥测用
-    `capture_timestamp − lag_s`（`test_align_body_poses_applies_lag_with_the_right_sign`
+    即该帧内容对应的真实时刻比帧的时刻 **早** `lag` 秒 ⇒ 查遥测用 `时刻 − lag_s`
+    （`test_align_body_poses_applies_lag_with_the_right_sign`
     把它钉住了：`lag·ω` 是固定偏差，符号错了外参就带恒定姿态偏）。
+  - **时间差必须用"收到帧的时刻"（`received_timestamp`）测，不能用 `capture_timestamp`**（2026-10 修）：
+    索引里两条时间戳都在，`capture_timestamp = received_timestamp − 录制时的 telemetry_lag`
+    是录制时**按配置假设**出来的拍摄时刻。拿它去互相关，测出来的是"该假设的残差"——
+    **换一次配置就平移一个 lag**（真机上表现为"把上次标定值回填、再录一次，Δt 自己收敛到 0"，
+    但那不代表标定对了）。受控实验（固定 `d_video`/`d_tel`、只改录制时的 lag）：
+
+    | 真实 d_video | 录制 lag_cfg | 遥测 d_tel | 用 capture 轴测 | 用 received 轴测 |
+    | --- | --- | --- | --- | --- |
+    | 0.15 | 0.15 | 0.00 | 0.0000 | **0.1495** |
+    | 0.15 | 0.15 | 0.05 | −0.0499 | **0.0997** |
+    | 0.30 | 0.15 | 0.05 | 0.0997 | **0.2493** |
+    | 0.15 | 0.00 | 0.00 | 0.1495 | 0.1495 |
+
+    每行两条轴之差恰好等于 `lag_cfg`。所以第 2/3 步统一走 received 轴，标出的
+    `telemetry_lag` = **绝对对齐量** `d_video − d_tel`（遥测自身的滞后必须一起抵掉：
+    运行时按 `拍摄时刻 = 收到时刻 − telemetry_lag` 取遥测），可直接回填 `VideoConfig`。
+    `meta.time_offset` 里另外给 `lag_baseline_s`（录制时的 lag）、
+    `lag_residual_on_capture_axis_s`（capture 轴残差）与 `cross_check_ok`
+    （`基准 + 残差 ≈ 绝对量`，实测差 ≤0.5 ms；只告警不改结果）。
+    老素材缺 `received_timestamp` 时 `load_flight_stamps` **显式报错**，不静默退回 capture 轴。
+    回归用例：`test_lag_measurement_is_absolute_on_received_axis`、
+    `test_flight_index_time_bases_and_missing_received`，以及端到端契约用例里
+    "注入视频延时 0.15 ⇒ 标出 ≈0.15（而非 ≈0）"这条断言。
   - **激励要求**：至少要 2 个**不平行**的旋转轴（OpenCV 文档同款要求），
     实测阈值 `MIN_AXIS_SPREAD_DEG = 15°`；所有运动对绕同一根轴时解不唯一，
     `run_extrinsics` 会显式报错而不是给个解。采不到旋转就重采，别调阈值。
   - `pattern_phase_ok` 的用途只有一个：发现"整体错格"这类**重投影误差不敏感**的几何错误；
     它**不能**消解标签二义性（见上）。
   - **仍未做**：真实素材上的复测（本机只有合成链路 + 内参/时间差的合成验证）；
-    `lag_s` 的实测值需要一次真实标定采集。
+    `lag_s` 的实测值需要一次真实标定采集。（手眼解本身已用旧版 OpenCV 官方实现交叉验证，
+    见上一条。）
   - **棋盘格渲染**：必须"深底 + 亮格"标准极性，且**模板四周不留边距**——留边距会让
     背景与边格同色、棋盘边界不可辨，`findChessboardCorners` 直接检不出
     （而 `checkChessboard` 仍返回 True，很容易误判成"几何没问题"）。
