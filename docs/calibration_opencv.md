@@ -49,8 +49,8 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
       会议纪要 `opencv/opencv/wiki/2026`——**2026-08-26 那期还在讨论"5.1 alpha?"**
       （Windows-ARM 二进制），说明当时仍处于早期阶段。按发布节奏推算：4.x 每 ~6 个月一发
       且偏爱年末（4.11.0 2025-01-09、4.13.0 2025-12-31），5.0.0 是 2026-06-06，
-      **下一个 5.x minor 大约落在 2026-12 ~ 2027-01；opencv-python 的 wheel 再滞后
-      1~4 周**（5.0.0 tag → 5.0.0.93 wheel 是 25 天）。**这是推算不是承诺**，
+      **下一个 5.x minor 大约落在 2026-12–2027-01；opencv-python 的 wheel 再滞后
+      1–4 周**（5.0.0 tag → 5.0.0.93 wheel 是 25 天）。**这是推算不是承诺**，
       而且 OpenCV 历史上推迟是常态。升级后一行就能判：`hasattr(cv2, "calibrateHandEye")`。
   - **手眼的方程与来源（唯一正确写法）**：棋盘格固定在 `C = T_world_board`，
     `G = T_world_body`（**遥测**）、`P = T_cam_board`（**PnP**）、`X = T_body_cam` 待求。
