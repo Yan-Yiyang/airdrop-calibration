@@ -908,6 +908,14 @@ def test_lever_arm_report_keeps_measured_value_without_estimate() -> None:
     assert lever_arm_report(skipped)["estimated"] is None
 
 
+def test_lever_arm_report_default_tracks_facade_constant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """兼容入口在运行时覆盖尺量常量后，报告默认值同步更新。"""
+    monkeypatch.setattr(calibrate_module, "MEASURED_T_BC", (0.1, 0.2, 0.3))
+    assert lever_arm_report(None)["authoritative"] == [0.1, 0.2, 0.3]
+
+
 def test_extrinsics_requires_one_body_pose_per_board_pose() -> None:
     """遥测 10 Hz、画面 30 Hz，不能"第 i 条遥测配第 i 帧"——数量对不上必须报错。"""
     x_true = true_x_matrix()
