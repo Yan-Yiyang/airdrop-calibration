@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .calibration.algorithms import (
+from .algorithms import (
     _quaternion_of,
     align_body_poses,
     angular_speed_from_poses,
@@ -38,15 +38,15 @@ from .calibration.algorithms import (
     telemetry_pose_at,
     telemetry_span_ok,
 )
-from .calibration.algorithms import lever_arm_report as _lever_arm_report
-from .calibration.flight_log import (
+from .algorithms import lever_arm_report as _lever_arm_report
+from .flight_log import (
     load_flight_frames_paired,
     load_flight_index,
     load_flight_stamps,
     load_flight_telemetry,
     load_flight_timestamps,
 )
-from .calibration.models import (
+from .models import (
     ExtrinsicsResult,
     FrameStamp,
     IntrinsicsResult,
@@ -55,12 +55,12 @@ from .calibration.models import (
     Telemetry,
     TelemetryLike,
 )
-from .calibration.report import (
+from .report import (
     SCHEMA_VERSION,
     CalibrationSource,
     build_calibration_report,
 )
-from .calibration.settings import (
+from .settings import (
     BODY_SPAN_FLOOR_M,
     BODY_SPAN_RATIO_MAX,
     BODY_SPAN_RATIO_MIN,

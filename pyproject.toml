@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airdrop-calibration"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = ["numpy", "opencv-python"]
+
+[project.scripts]
+airdrop-calibration = "airdrop_calibration.cli:main"
+
+[project.optional-dependencies]
+visual = ["pillow"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-timeout", "ruff", "pyright", "scipy"]
+
+[tool.setuptools.packages.find]
+include = ["airdrop_calibration*"]
+
+[tool.setuptools.package-data]
+airdrop_calibration = ["assets/**/*"]
+
+[tool.ruff]
+"line-length" = 100
+"target-version" = "py314"
+
+[tool.ruff.lint]
+"select" = ["E4", "E7", "E9", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF", "BLE", "SLF", "PL", "PT"]
+"ignore" = ["UP037", "PLR2004", "PLC0415", "PT018", "RUF046"]
+"allowed-confusables" = ["（", "）", "，", "：", "；", "？", "×", "−", "–", "α", "ρ", "σ"]
+
+[tool.ruff.lint.pylint]
+"max-args" = 10
+"max-positional-args" = 6
+"max-branches" = 15
+"max-statements" = 60
+"max-returns" = 8
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["SLF001", "PT011", "PT018", "PLR0913", "PLR0915", "PLR0917", "E741", "C408", "RUF015", "UP031", "RUF005", "RUF007", "B007", "RUF043", "RUF059", "PLW2901", "SIM102"]
+"airdrop_calibration/**" = ["T201", "PLR0913", "PLR0915", "PLR0917", "INP001", "UP031", "PLW2901"]
+
+[tool.ruff.lint.isort]
+"known-first-party" = ["airdrop_calibration"]
+
+[tool.ruff.format]
+"quote-style" = "double"
+"indent-style" = "space"
+"line-ending" = "auto"
+
+[tool.pyright]
+"include" = ["airdrop_calibration", "tests"]
+"typeCheckingMode" = "basic"
+"pythonVersion" = "3.14"
+"reportUnsupportedDunderAll" = "none"
+"reportPrivateUsage" = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["wsl: 需要 WSL/ext4 的脚本契约"]
+timeout = 180
+timeout_method = "thread"

@@ -16,6 +16,7 @@ import math
 import shutil
 import uuid
 from collections.abc import Iterator, Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 import cv2
@@ -23,10 +24,9 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from airdrop.georef import rotation_x, rotation_y, rotation_z
-from airdrop.telemetry.models import TelemetrySnapshot
-from tools import calibrate as calibrate_module
-from tools.calibrate import (
+from airdrop_calibration import calibrate as calibrate_module
+from airdrop_calibration.algorithms import rotation_x, rotation_y, rotation_z
+from airdrop_calibration.calibrate import (
     MEASURED_T_BC,
     ExtrinsicsResult,
     align_body_poses,
@@ -50,6 +50,7 @@ from tools.calibrate import (
     telemetry_pose_at,
     telemetry_span_ok,
 )
+from airdrop_calibration.models import Telemetry as TelemetrySnapshot
 
 # 真值
 TRUE_FX, TRUE_FY = 900.0, 902.0
@@ -188,7 +189,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
     但 ``frames[k]`` 配的是另一行的时刻——实测造成 0.2s 错位，Δt 与手眼外参
     全建立在错配上，产出一份看起来正常的错误 ``camera_calib.json``。
     """
-    from tools.calibrate import load_flight_frames_paired, load_flight_index
+    from airdrop_calibration.calibrate import load_flight_frames_paired, load_flight_index
 
     flight = workdir / "flight"
     (flight / "frames").mkdir(parents=True)
@@ -246,7 +247,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
 
 def test_flight_index_time_bases_and_missing_received(workdir: Path) -> None:
     """帧索引的两条时间轴：默认给 received（标定用），capture 只做诊断；缺字段显式报错。"""
-    from tools.calibrate import load_flight_index, load_flight_stamps
+    from airdrop_calibration.calibrate import load_flight_index, load_flight_stamps
 
     flight = workdir / "flight"
     flight.mkdir()
@@ -317,7 +318,7 @@ def test_lag_measurement_is_absolute_on_received_axis() -> None:
 
     本用例直接喂受控序列（不渲染）：同一批姿态，只改录制时的 lag，看两条轴分别怎么变。
     """
-    from tools.calibrate import measure_frame_telemetry_lag
+    from airdrop_calibration.calibrate import measure_frame_telemetry_lag
 
     count = 30
     frame_dt = 1.0 / 30.0
@@ -1290,16 +1291,18 @@ def _write_calibration_flight(
         assert np.allclose(quaternion_to_matrix_local((w, x, y, z)), pose[:3, :3], atol=1e-9)
         lines.append(
             json.dumps(
-                TelemetrySnapshot(
-                    timestamp=stamp,
-                    north_m=float(pose[0, 3]),
-                    east_m=float(pose[1, 3]),
-                    down_m=float(pose[2, 3]),
-                    quaternion_w=w,
-                    quaternion_x=x,
-                    quaternion_y=y,
-                    quaternion_z=z,
-                ).as_dict()
+                asdict(
+                    TelemetrySnapshot(
+                        timestamp=stamp,
+                        north_m=float(pose[0, 3]),
+                        east_m=float(pose[1, 3]),
+                        down_m=float(pose[2, 3]),
+                        quaternion_w=w,
+                        quaternion_x=x,
+                        quaternion_y=y,
+                        quaternion_z=z,
+                    )
+                )
             )
         )
     (flight_dir / "telemetry.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")

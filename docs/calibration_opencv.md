@@ -1,18 +1,18 @@
-# 标定与 OpenCV 5.0 易错点（`tools/calibrate.py`）
+# 标定与 OpenCV 5.0 易错点（`airdrop_calibration/calibrate.py`）
 
 本文档说明：三步标定流水线（内参 → 画面/遥测时间差 → 手眼外参）的实测结论，以及围绕
 OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外参、或怀疑"某个 cv2 函数没了"时请先阅读本文档。
 
 ---
 
-- **`tools/calibrate.py`（P6 下半）= 三步标定流水线，已落地**（内参 → 画面/遥测时间差 →
+- **`airdrop_calibration/calibrate.py`（P6 下半）= 三步标定流水线，已落地**（内参 → 画面/遥测时间差 →
   手眼外参）。代码与合成数据的回归契约见 `tests/test_calibrate.py`；它覆盖整个
   `calibrate()` 输出，包括 `t_bc` 使用尺量值、估计值与差值写入 `meta.lever_arm`。
   这些合成回归不代表真实素材标定精度；真实素材复测仍未完成。
   - **OpenCV 相关问题的三类分因（不要一概归因于 `CV_EXPORTS_W`）**：
     **(a) 绑定标记丢失**——症状是"`cv2` 里没有这个属性"；
     **(b) 5.0 的行为/位置变更**——函数在，但类型、模块或后端拆分变了：FFmpeg 后端拆成
-    插件 DLL（见 [`video_hm30_ffmpeg.md`](video_hm30_ffmpeg.md)）、`VideoCapture::get()` 不支持时返回 −1、DNN 换引擎；
+    插件 DLL（见 主仓图传文档）、`VideoCapture::get()` 不支持时返回 −1、DNN 换引擎；
     **(c) 一直沿用的既有约定、被我们误记成"5.0 变了"**——如 `calibrateCamera` 只收 float32、
     `moments` 不收 float64。**(b)(c) 两类都不会表现为"属性消失"，别混为一谈。**
   - **`cv2.calibrateHandEye` 在 Python 侧不可用，但原因不是"被移除"**：OpenCV 5.0 把
