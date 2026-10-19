@@ -60,6 +60,10 @@ airdrop_calibration = ["assets/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["wsl: 需要 WSL/ext4 的脚本契约"]
+addopts = ["--strict-markers"]
+markers = [
+    "integration: 跨模块、跨仓或真实子进程集成回归",
+    "wsl: 需要 WSL/ext4 的脚本契约",
+]
 timeout = 180
 timeout_method = "thread"

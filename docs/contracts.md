@@ -65,9 +65,9 @@ python -m airdrop_sim make-vehicle --width 800 --height 600 --hfov 1.2 --out-dir
 
 ## 主仓演练消费
 
-`sitl-recon --manifest PATH` 固定本次相机配置、原点与真值，随后报告和延时扫描使用同一份场景，
-不修改其它演练的全局参数。省略 manifest 时仍使用 r2/seed 0。省略 `--lag` 时使用相机配置中的延时；
-显式 `--lag` 覆盖本次延时。图片靶标 manifest 不用于数字识别精度报告。
+`python -m airdrop.run mission --mode sitl --manifest PATH` 固定本次相机配置、原点与真值，
+随后报告和延时扫描使用同一份场景，不修改其它演练的全局参数。省略 manifest 时仍使用 r2/seed 0。
+省略 `--lag` 时使用相机配置中的延时；显式 `--lag` 覆盖本次延时。图片靶标 manifest 不用于数字识别精度报告。
 
 内置侦查航线仍是固定翼 r2/seed 0 的路径。改变布局、视场或安装位置后先核验其覆盖；
 内置航线无法覆盖时会在创建运行产物和连接飞控前失败，需通过 Python 调用显式提供匹配的 `route`。

@@ -10,6 +10,8 @@ import pytest
 
 from airdrop_calibration import cli as run
 
+pytestmark = pytest.mark.integration
+
 
 def _config_kwargs(module_name: str, kwargs: dict) -> dict:
     """只挑 ``build_config`` 认的关键字（``dry_run``/``record`` 这类是运行期开关）。"""

@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
-import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1172,23 +1170,16 @@ def test_full_pipeline_rejects_insufficient_rotation_excitation() -> None:
 # ----------------------------------------------------------------------
 # 标定 JSON 的输出契约（杆臂：尺量为准 + 估计值比对）
 # ----------------------------------------------------------------------
-CALIB_TMP_ROOT = Path(__file__).resolve().parents[1] / ".calibrate-test-tmp"
 
 
 @pytest.fixture
-def workdir() -> Iterator[Path]:
+def workdir(tmp_path: Path) -> Path:
     """工作区内的临时目录；用例结束整棵删掉。
 
     不用 ``tmp_path``：部分受限执行环境里 pytest 的 basetemp 目录建好后不可枚举、
     不可删除（``PermissionError: [WinError 5]``）。
     """
-    CALIB_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    path = CALIB_TMP_ROOT / uuid.uuid4().hex[:8]
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+    return tmp_path
 
 
 def _write_calibration_flight(
