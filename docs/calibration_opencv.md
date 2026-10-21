@@ -1,36 +1,16 @@
 # 标定与 OpenCV 5.0 易错点（`airdrop_calibration/calibrate.py`）
 
-本文档说明：三步标定流水线（内参 → 画面/遥测时间差 → 手眼外参）的实测结论，以及围绕
+本文档说明：三步标定流水线（内参 → 画面/遥测时间差 → 手眼外参）的接口与数学条件，以及围绕
 OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外参、或怀疑"某个 cv2 函数没了"时请先阅读本文档。
 
 ---
 
-- **`airdrop_calibration/calibrate.py`（P6 下半）= 三步标定流水线，已落地**（内参 → 画面/遥测时间差 →
+- **`airdrop_calibration/calibrate.py` = 三步标定流水线**（内参 → 画面/遥测时间差 →
   手眼外参）。代码与合成数据的回归契约见 `tests/test_calibrate.py`；它覆盖整个
   `calibrate()` 输出，包括 `t_bc` 使用尺量值、估计值与差值写入 `meta.lever_arm`。
   这些合成回归不代表真实素材标定精度；真实素材复测仍未完成。
-  - **OpenCV 相关问题的三类分因（不要一概归因于 `CV_EXPORTS_W`）**：
-    **(a) 绑定标记丢失**——症状是"`cv2` 里没有这个属性"；
-    **(b) 5.0 的行为/位置变更**——函数在，但类型、模块或后端拆分变了：FFmpeg 后端拆成
-    插件 DLL（见 主仓图传文档）、`VideoCapture::get()` 不支持时返回 −1、DNN 换引擎；
-    **(c) 一直沿用的既有约定、被我们误记成"5.0 变了"**——如 `calibrateCamera` 只收 float32、
-    `moments` 不收 float64。**(b)(c) 两类都不会表现为"属性消失"，别混为一谈。**
-  - **`cv2.calibrateHandEye` 在 Python 侧不可用，但原因不是"被移除"**：OpenCV 5.0 把
-    `calib3d` 拆成 `geometry`/`calib`/`stereo`/`ptcloud`，函数搬进 `modules/calib`，
-    **C++ 声明与签名一字未改**，但 OpenCV 5.0.0 的绑定标记从 `CV_EXPORTS_W` 变成了
-    `CV_EXPORTS`，于是 Python
-    侧没生成。旁证：`cv2/__init__.pyi` 里 `CALIB_HAND_EYE_*` /
-    `HandEyeCalibrationMethod` / `RobotWorldHandEyeCalibrationMethod` 都在，唯独没有函数。
-    `opencv-contrib-python` **解决不了**（contrib 用同一份主仓源码，一样没有 `_W`），
-    装了还会扰动 torch/ultralytics——**不要安装**。第三步是自己实现的 `solve_hand_eye`。
-    - OpenCV 的 issue 记录了该绑定问题，修复已合并；
-      报告 [issue #29565](https://github.com/opencv/opencv/issues/29565)
-      "calibrateHandEye is missing in python package for version 5.0.0.93"
-      （标为 `bug` 与 `category: python bindings`，milestone 5.1，已关闭）；修复
-      [PR #29584](https://github.com/opencv/opencv/pull/29584) 将函数的绑定标记改回
-      `CV_EXPORTS_W` 并补 Python 回归测试，4.x 的测试回移见
-      [PR #29693](https://github.com/opencv/opencv/pull/29693)。可用性取决于安装的 OpenCV wheel；使用时应以当前
-      环境中的 Python API 为准。自研 `solve_hand_eye` 使用同一 `A X = X B` 约定。
+  - **OpenCV API先检查实际安装包**：绑定缺失、输入类型不符和模块变更是不同问题。使用前检查`hasattr(cv2, "calibrateHandEye")`并执行最小几何调用，不能根据问题关闭或版本号推断当前wheel已可用。
+    某些OpenCV 5.0 Python构建缺失手眼绑定，历史原因见官方[issue #29565](https://github.com/opencv/opencv/issues/29565)。本工具保留自研`solve_hand_eye`及同一`A X = X B`约定；替换后端需要独立数值回归，不能靠安装contrib包代替API验证。
   - **手眼的方程与来源（唯一正确写法）**：棋盘格固定在 `C = T_world_board`，
     `G = T_world_body`（**遥测**）、`P = T_cam_board`（**PnP**）、`X = T_body_cam` 待求。
     由 `G·X·P = C` 得 `A_ij = G_j⁻¹G_i`、`B_ij = P_jP_i⁻¹`，方程 **`A X = X B`**
@@ -51,7 +31,7 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
     - `_base_look_down_pose` 的图像 `v` 轴必须与板子 `+y` **同向**：反过来合成图成了镜像，
       角点标签整体反序。另外 `look_at_board` 的扰动必须
       **旋转矩阵右乘**，不能加在旋转向量上（`|rvec|` 接近 π 时"向量相加"会剧烈跳变）。
-  - **`calibrateCamera` 只收 float32——这不是 5.0 的变化**：实测 objectPoints/imagePoints
+  - **`calibrateCamera` 只收 float32——这不是 5.0 的变化**：objectPoints/imagePoints
     任一为 float64 都抛 `objectPoints should contain vector of vectors of points of type
     Point3f`；查 4.x 源码（PR #13803 的 diff，`modules/calib3d/src/calibration.cpp`）里
     写的是同样的 `checkVector(3, CV_32F)`，所以 4.x 也收不了 float64。
@@ -105,7 +85,7 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
     回归用例：`test_lag_measurement_is_absolute_on_received_axis`、
     `test_flight_index_time_bases_and_missing_received`。
   - **激励要求**：至少要 2 个**不平行**的旋转轴（OpenCV 文档同款要求），
-    实测阈值 `MIN_AXIS_SPREAD_DEG = 15°`；所有运动对绕同一根轴时解不唯一，
+    退化检查阈值 `MIN_AXIS_SPREAD_DEG = 15°`；所有运动对绕同一根轴时解不唯一，
     `run_extrinsics` 会显式报错而不是给个解。采不到旋转就重采，别调阈值。
   - `pattern_phase_ok` 的用途只有一个：发现"整体错格"这类**重投影误差不敏感**的几何错误；
     它**不能**消解标签二义性（见上）。
