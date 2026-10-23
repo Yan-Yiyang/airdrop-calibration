@@ -53,6 +53,10 @@ class Telemetry:
     quaternion_x: float | None = None
     quaternion_y: float | None = None
     quaternion_z: float | None = None
+    quaternion_timestamp_us: int | None = None
+    quaternion_received_at: float | None = None
+    position_timestamp_us: int | None = None
+    position_velocity_received_at: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.timestamp, bool):
@@ -69,6 +73,8 @@ class Telemetry:
             "quaternion_x",
             "quaternion_y",
             "quaternion_z",
+            "quaternion_received_at",
+            "position_velocity_received_at",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -78,6 +84,12 @@ class Telemetry:
                 if not math.isfinite(number):
                     raise ValueError(f"遥测 {name} 必须是有限数值")
                 object.__setattr__(self, name, number)
+        for name in ("quaternion_timestamp_us", "position_timestamp_us"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, bool) or not math.isfinite(value) or int(value) != value:
+                    raise ValueError(f"遥测 {name} 必须是整数源时标")
+                object.__setattr__(self, name, int(value))
 
     def is_valid(self) -> bool:
         """存在位置或姿态观测时返回真。"""

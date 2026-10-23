@@ -76,8 +76,8 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
     索引里两条时间戳都在，`capture_timestamp = received_timestamp − 录制时的 telemetry_lag`
     是录制时**按配置假设**出来的拍摄时刻。拿它去互相关，测出来的是"该假设的残差"——
     **改动录制时的配置会平移这个残差**。所以第 2/3 步统一走 received 轴，标出的
-    `telemetry_lag` = **绝对对齐量** `d_video − d_tel`（遥测自身的滞后必须一起抵掉：
-    运行时按 `拍摄时刻 = 收到时刻 − telemetry_lag` 取遥测），可直接回填 `VideoConfig`。
+    `telemetry_lag` = **绝对对齐量** `d_video − d_quaternion_reference`（遥测自身的滞后必须一起抵掉：
+    运行时在四元数接收参照的 `收到帧时刻 − telemetry_lag` 查询源对齐遥测），可直接回填 `VideoConfig`。
     `meta.time_offset` 里另外给 `lag_baseline_s`（录制时的 lag）、
     `lag_residual_on_capture_axis_s`（capture 轴残差）与 `cross_check_ok`
     （`基准 + 残差 ≈ 绝对量`；只告警不改结果）。
@@ -95,3 +95,7 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
     （而 `checkChessboard` 仍返回 True，很容易误判成"几何没问题"）。
   - **`cv2.Rodrigues` 的约定遇到过两次问题**：它收的是世界→相机（相机轴作**行**）；
     与其手推旋转矩阵，不如"构造已知投影 + `solvePnP` 反解"更可靠。
+
+## 源时标参照
+
+合并快照的接收/组装时刻混合了异步字段，属于已确认 bug。生产流程以独立四元数源时标去重，用 `quaternion_received_at` 计算第 2 步姿态时间序列，第 3 步按同一接收参照映射到源时刻分别内插位置和姿态。输出 `meta.time_offset.telemetry_reference=quaternion_received_at` 与 `pose_alignment=source_timestamp_us`。帧始终使用原始 `received_timestamp`，只扣一次绝对标定量；原 `capture_timestamp` 用于残差互核。缺少源时标、跨重启或超过在线插值门限的断流时须重新采集连续片段。该有效对齐量包含四元数链路参照，不是独立测得的绝对视频单向延迟。

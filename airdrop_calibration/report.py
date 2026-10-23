@@ -71,6 +71,8 @@ def build_calibration_report(
                 "step_s": lag_step_s,
                 "curve": lag.curve if lag.ok else [],
                 "time_base": measurement.time_base,
+                "telemetry_reference": "quaternion_received_at",
+                "pose_alignment": "source_timestamp_us",
                 "lag_baseline_s": measurement.baseline_s,
                 "lag_residual_on_capture_axis_s": (
                     float(measurement.residual.lag_s)

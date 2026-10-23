@@ -12,7 +12,6 @@ from typing import Any
 import numpy as np
 
 from .algorithms import (
-    _quaternion_of,
     align_body_poses,
     angular_speed_from_poses,
     board_object_points,
@@ -84,6 +83,7 @@ from .settings import (
     TIME_BASE_CAPTURE,
     TIME_BASE_RECEIVED,
 )
+from .source_timeline import SourceTimeline
 
 LOGGER = logging.getLogger("calibrate")
 
@@ -286,9 +286,9 @@ def calibrate(
     if rejected:
         LOGGER.warning("  丢弃 %d 帧（角点检不出）", rejected)
 
-    snapshots = [
-        item for item in load_flight_telemetry(flight_dir) if _quaternion_of(item) is not None
-    ]
+    # BUG：合并快照 timestamp 不是四元数采样/接收时刻，会把其它字段更新延迟混入标定。
+    timeline = SourceTimeline(load_flight_telemetry(flight_dir))
+    snapshots = timeline.attitudes
     measurement = LagMeasurement(
         absolute=LagResult(lag_s=0.0, peak=float("nan"), samples=0),
         residual=None,
@@ -333,11 +333,11 @@ def calibrate(
     # ---- 步骤三 ----
     LOGGER.info("步骤三：手眼外参")
     extrinsics: ExtrinsicsResult | None = None
-    if board_poses and len(snapshots) >= 2:
+    if board_poses and len(snapshots) >= 2 and lag.ok:
         # 与画面**同时刻**的机体位姿：遥测 10 Hz、画面 30 Hz，
         # 直接把"第 i 条遥测"配给"第 i 帧"是错的，必须按帧时刻重采样
         paired_board, paired_body = align_body_poses(
-            board_poses, snapshots, lag_s=lag.lag_s if lag.ok else 0.0
+            board_poses, snapshots, lag_s=lag.lag_s, pose_at=timeline.pose_at
         )
         dropped = len(board_poses) - len(paired_board)
         if dropped:
@@ -355,7 +355,7 @@ def calibrate(
         except ValueError as exc:
             LOGGER.warning("  手眼标定失败: %s", exc)
     else:
-        LOGGER.warning("  缺少棋盘格位姿或遥测位姿，跳过外参")
+        LOGGER.warning("  缺少棋盘格/遥测位姿或有效时间差，跳过外参")
 
     return build_calibration_report(
         intrinsics=intrinsics,

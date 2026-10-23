@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -626,10 +626,12 @@ def measure_frame_telemetry_lag(
     标定值再标一次，Δt 自己收敛到 0"，但那不代表标定对了，只代表配置与假设一致了。
     用 ``received_times``（原始量）测出来的才是**绝对对齐量**：
 
-        ``绝对对齐量 = 视频链路延时 d_video − 遥测链路延时 d_tel``
+        ``绝对对齐量 = 视频链路延时 d_video − 四元数接收参照延时 d_quaternion``
 
-    它正是第 3 步配对与运行时 :attr:`airdrop.video.VideoConfig.telemetry_lag` 需要的值
-    （运行时按 ``拍摄时刻 = 收到时刻 − telemetry_lag`` 取遥测；遥测自身的滞后必须一起抵掉）。
+    ``snapshots`` 必须是已按四元数原始接收时刻去重的姿态序列，生产入口由
+    ``SourceTimeline.attitudes`` 提供。合并快照组装时刻不是该参照，直接传入会测错。
+    第 3 步和运行时都在 ``received_timestamp − telemetry_lag`` 查询源时标对齐位姿。
+    这个查询时刻是四元数接收参照上的时刻，不是精确曝光墙钟。
     受控实验（固定 d_video/d_tel、只改录制时配置的 lag）：received 轴的结果不变、
     capture 轴的结果恰好平移一个 lag；详见 ``docs/calibration_opencv.md``。
 
@@ -1043,6 +1045,7 @@ def align_body_poses(
     snapshots: Sequence[TelemetryLike],
     *,
     lag_s: float = 0.0,
+    pose_at: Callable[[float], np.ndarray | None] | None = None,
 ) -> tuple[list[tuple[float, np.ndarray, np.ndarray]], list[np.ndarray]]:
     """把棋盘格位姿与**同一时刻**的遥测位姿配成对。
 
@@ -1051,15 +1054,20 @@ def align_body_poses(
 
     ⚠ ``lag_s`` 的符号（这里错一次，外参就会带一个恒定的姿态偏差）：
     :func:`estimate_lag_by_correlation` 里 ``lag > 0`` 表示"**画面**比姿态滞后"，
-    即该帧**内容**对应的真实时刻比它的 ``capture_timestamp`` 早 ``lag`` 秒，
-    所以查遥测用 ``capture_timestamp − lag_s``。
+    ``board_poses`` 使用原始 ``received_timestamp``，查询时只扣一次绝对 ``lag_s``。
+    生产入口必须通过 ``pose_at`` 提供按字段源时标对齐的查询；不使用推定的
+    ``capture_timestamp`` 再扣一次延迟。未提供回调的数学接口要求输入已同轴的位姿序列。
     """
     paired_board: list[tuple[float, np.ndarray, np.ndarray]] = []
     paired_body: list[np.ndarray] = []
     # 遥测索引只建一次（见 _index_telemetry 的说明：原来每个位姿都重建一遍整张表）
-    index = _index_telemetry(snapshots)
+    index = _index_telemetry(snapshots) if pose_at is None else None
     for stamp, rvec, tvec in board_poses:
-        pose = _telemetry_pose_from_index(index, stamp - lag_s)
+        if pose_at is None:
+            assert index is not None
+            pose = _telemetry_pose_from_index(index, stamp - lag_s)
+        else:
+            pose = pose_at(stamp - lag_s)
         if pose is None:
             continue
         paired_board.append((stamp, rvec, tvec))

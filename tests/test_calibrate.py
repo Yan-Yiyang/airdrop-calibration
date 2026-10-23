@@ -1246,7 +1246,7 @@ def _write_calibration_flight(
                 {
                     "index": index,
                     "filename": name,
-                    "capture_timestamp": capture,
+                    "capture_timestamp": capture + video_delay_s - lag_cfg_s,
                     "received_timestamp": capture + video_delay_s,  # 与 VideoFrame.timestamp 同义
                     "lag": lag,
                     "extrapolated": False,
@@ -1285,6 +1285,10 @@ def _write_calibration_flight(
                 asdict(
                     TelemetrySnapshot(
                         timestamp=stamp,
+                        quaternion_received_at=stamp,
+                        quaternion_timestamp_us=round((stamp - t0 - telemetry_delay_s + 1) * 1e6),
+                        position_velocity_received_at=stamp,
+                        position_timestamp_us=round((stamp - t0 - telemetry_delay_s + 1) * 1e6),
                         north_m=float(pose[0, 3]),
                         east_m=float(pose[1, 3]),
                         down_m=float(pose[2, 3]),
