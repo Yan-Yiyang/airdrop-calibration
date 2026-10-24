@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections.abc import Callable, Sequence
-from typing import Any
 
 import numpy as np
 
@@ -17,17 +16,11 @@ from .models import (
     TelemetryLike,
 )
 from .settings import (
-    BODY_SPAN_FLOOR_M,
-    BODY_SPAN_RATIO_MAX,
-    BODY_SPAN_RATIO_MIN,
     LAG_CROSS_CHECK_TOL_S,
     LAG_SEARCH_S,
     LAG_STEP_S,
-    LEVER_ARM_RESIDUAL_FLOOR_M,
-    LEVER_ARM_RESIDUAL_RATIO,
     MAX_MOTION_PAIRS,
     MAX_VIEWS,
-    MEASURED_T_BC,
     MIN_AXIS_SPREAD_DEG,
     MIN_PAIR_ROTATION_DEG,
     MIN_VIEWS,
@@ -123,7 +116,7 @@ def pattern_phase_ok(
     pattern_size: tuple[int, int] = PATTERN_SIZE,
     square_size: float = SQUARE_SIZE_M,
 ) -> float:
-    """用**方格明暗相位**校验渲染/位姿的几何一致性，返回相符比例（0~1）。
+    """用内侧方格的黑白相位校验位姿，返回相符比例（0~1）。
 
     用途只有一个：**发现"棋盘格整体错格"这类几何错误**。例如 :func:`render_board`
     的 ``to_board`` 少减一个 ``tile`` 时，棋盘格相对对象点整体错开一整格，
@@ -131,21 +124,40 @@ def pattern_phase_ok(
     （实测正确渲染是 1.000）。重投影误差对这类错误**完全不敏感**（仍有 0.1 px），
     只有相位能发现。
 
-    ⚠ **它不能区分"正序/反序标签"**：棋盘格（格数无论奇偶）绕板面法向转 180° 后图像
-    一模一样，两种标签分配的相位相符率都是 1.000（实测）。标签二义性要靠
-    :func:`solve_board_poses` 的**相邻帧连续性**解决，别指望这个函数。
-
-    阈值取"所有采样点的中值"，所以不依赖绝对灰度（真实照片的曝光差异不影响）。
+    该分数只反映采样相符比例。候选位姿筛选另要求黑白中位数对比度至少 25 灰阶，
+    并要求足够数量的有效内侧方格样本，避免低对比图像被噪声误判为高分。
     """
-    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
+    return _pattern_phase_quality(
+        image,
+        rvec,
+        tvec,
+        camera_matrix,
+        dist_coeffs,
+        pattern_size=pattern_size,
+        square_size=square_size,
+    )[0]
+
+
+def _pattern_phase_quality(
+    image: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    *,
+    pattern_size: tuple[int, int],
+    square_size: float,
+) -> tuple[float, float, int]:
+    """返回相位相符比例、黑白对比度和有效内侧方格数。"""
+    import cv2
 
     cols, rows = pattern_size
-    centres: list[tuple[float, float, float]] = []
-    want_light: list[bool] = []
-    for i in range(-1, cols):
-        for j in range(-1, rows):
-            centres.append(((i + 0.5) * square_size, (j + 0.5) * square_size, 0.0))
-            want_light.append((i + j) % 2 == 0)
+    centres = [
+        ((col + 0.5) * square_size, (row + 0.5) * square_size, 0.0)
+        for row in range(rows - 1)
+        for col in range(cols - 1)
+    ]
+    want_light = [(col + row) % 2 == 0 for row in range(rows - 1) for col in range(cols - 1)]
     points = np.asarray(centres, dtype=np.float64).reshape(-1, 1, 3)
     projected, _ = cv2.projectPoints(points, rvec, tvec, camera_matrix, dist_coeffs)
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -155,13 +167,15 @@ def pattern_phase_ok(
         if x < 3 or y < 3 or x >= gray.shape[1] - 4 or y >= gray.shape[0] - 4:
             continue
         patch = gray[y - 3 : y + 4, x - 3 : x + 4]
-        samples.append((float(patch.mean()), expect_light))
-    if not samples:
-        return 0.0
-    values = [value for value, _ in samples]
-    threshold = 0.5 * (min(values) + max(values))
-    matched = sum(1 for value, expect in samples if (value > threshold) == expect)
-    return matched / len(samples)
+        samples.append((float(np.median(patch)), expect_light))
+    bright = [value for value, light in samples if light]
+    dark = [value for value, light in samples if not light]
+    if len(samples) < 8 or min(len(bright), len(dark)) < 4:
+        return 0.0, 0.0, len(samples)
+    contrast = float(np.median(bright) - np.median(dark))
+    threshold = (float(np.median(bright)) + float(np.median(dark))) / 2
+    score = sum(value > threshold if light else value < threshold for value, light in samples)
+    return score / len(samples), contrast, len(samples)
 
 
 def solve_board_poses(
@@ -173,34 +187,25 @@ def solve_board_poses(
     pattern_size: tuple[int, int] = PATTERN_SIZE,
     square_size: float = SQUARE_SIZE_M,
 ) -> list[tuple[np.ndarray, np.ndarray] | None]:
-    """逐帧检测 + 解位姿；用**相邻帧连续性**把"正序/反序标签"统一到同一支。
+    """逐帧检测 + 解位姿；用黑白格心相位选择唯一角点方向。
 
-    为什么必须统一
-    --------------
-    棋盘格绕板面法向转 180° 后图像**完全一样**（方格数无论奇偶都如此），所以单帧图像
-    根本无法判断"哪个角点是第 0 号"：两种标签分配都拟合到亚像素（实测 PnP 残差都是
-    0.1 px），**方格相位也完全一致**（实测两者相符率都是 1.000）。
-
-    但两种分配的位姿恰好相差"绕板面法向 180°"，那是一个**常量右乘** ``R_b``::
-
-        P'_i = P_i·R_b   ⇒   B'_ij = P'_j P'_i⁻¹ = P_j P_i⁻¹ = B_ij
-
-    也就是说：**只要全局用同一支，``AX=XB`` 的解一模一样，选哪支都无所谓；
-    混用才会让解算崩掉**（残差会飙到几十度）。这里用"与上一帧位姿夹角最小"来保证
-    一致——板子固定、飞机连续运动，真姿态不可能帧间翻 180°。
+    内角点列/行同奇偶时，反序映射不改变内部方格相位，单帧图像无法选择方向，故拒绝。
+    奇偶相反时，反序会翻转相位；只接受样本足够、对比度足够且恰有一个候选匹配的帧。
 
     返回与 ``images`` 等长的列表，检不出角点的位置为 ``None``。
     """
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
 
+    cols, rows = pattern_size
+    if (cols - rows) % 2 == 0:
+        raise ValueError("棋盘格内角点列数与行数必须一奇一偶，才能用单帧黑白相位判定方向")
     poses: list[tuple[np.ndarray, np.ndarray] | None] = []
-    previous: np.ndarray | None = None
     for image in images:
         corners = detect_corners(image, pattern_size)
         if corners is None:
             poses.append(None)
             continue
-        candidates: list[tuple[np.ndarray, np.ndarray]] = []
+        candidates: list[tuple[float, np.ndarray, np.ndarray]] = []
         for candidate_corners in (corners, corners[::-1]):
             ok, rvec, tvec = cv2.solvePnP(
                 object_points,
@@ -210,21 +215,27 @@ def solve_board_poses(
                 flags=cv2.SOLVEPNP_IPPE,
             )
             if ok:
-                candidates.append((rvec, tvec))
+                score, contrast, samples = _pattern_phase_quality(
+                    image,
+                    rvec,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                    pattern_size=pattern_size,
+                    square_size=square_size,
+                )
+                if samples >= 8 and contrast >= 25.0:
+                    candidates.append((score, rvec, tvec))
         if not candidates:
             poses.append(None)
             continue
-        if previous is None:
-            chosen = candidates[0]
-        else:
-            chosen = min(
-                candidates,
-                key=lambda item: rotation_angle_deg(
-                    _pose_matrix(item[0], item[1])[:3, :3].T @ previous
-                ),
-            )
-        previous = _pose_matrix(chosen[0], chosen[1])[:3, :3].copy()
-        poses.append(chosen)
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if candidates[0][0] < 0.8 or (
+            len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.5
+        ):
+            poses.append(None)
+            continue
+        poses.append((candidates[0][1], candidates[0][2]))
     return poses
 
 
@@ -248,7 +259,7 @@ def render_board(
     ``cv2.getPerspectiveTransform`` 把模板的四角映射到真实位姿下的四角——
     对 z=0 平面来说这就是精确的透视变换（不是近似）。
 
-    **配色必须是"深底 + 亮格"（左上角为深格）**：``findChessboardCorners`` 依赖
+    **配色必须是"深底 + 亮格"（左上角外格为亮格）**：``findChessboardCorners`` 依赖
     标准棋盘格的明暗极性，反了会直接检不出（实测：极性反了 SB 与经典版
     双双返回 False，而 ``checkChessboard`` 仍为 True——说明几何没问题、只是极性）。
     """
@@ -759,17 +770,10 @@ def solve_hand_eye(
     平移
     ----
     ``R_a t_x + t_a = R_x t_b + t_x`` ⇒ ``(R_a − I) t_x = R_x t_b − t_a``。
-    注意它**必须用到 ``t_a``**，也就是遥测位置。室内手持采集没有 GPS，``t_a`` 不可信，
-    所以 ``t_x`` 在本项目里**只当校验用**：标定文件的杆臂是尺量值，这里算出来的估计值
-    与它对比（差得离谱 ⇒ 遥测位置不可用）。能否采信由 :func:`run_extrinsics` 的**两条**判据
-    决定：平移方程残差自洽，且 :func:`telemetry_span_ok`（遥测位置真的动过、与画面同量级）
-    ——``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来；而"遥测位置恒零/几乎
-    不动"这类假数据，残差**也可能一位都不变**（见 :data:`BODY_SPAN_FLOOR_M`）。
+    位置平移由独立的 :func:`estimate_translation_fixed_rotation` 在固定已求旋转后估计，
+    其结果与尺量值一并输出供人工判断。
 
-    ⚠ **平移必须"堆叠"成 (3n×3) 最小二乘，不能把各对方程逐行相加**：逐行相加 ≈ 把各对的
-    右端项做**等权平均**，而每对的信息量正比于 ``R_a − I``——旋转角小的对几乎不提供信息、
-    却把噪声全额带进平均。cv2 官方 ``calibrateHandEye`` 的 PARK 方法就是堆叠最小二乘，本实现保持相同的求解形式。回归用例
-    ``test_translation_branch_is_stacked_least_squares`` 把它钉住。
+    平移方程按所有运动对堆叠为 ``(3n×3)`` 最小二乘。
 
     返回 ``(R_x, t_x | None, 相对奇异值, 旋转轴张角(度))``。
     相对奇异值 ``s[-1]/s[0]`` 越接近 0 说明运动激励越充分（绝对值随量纲变化，只有相对量可比）。
@@ -820,6 +824,13 @@ def _rotation_axis(rotation: np.ndarray) -> np.ndarray:
     return vector / norm if norm > 1e-12 else np.zeros(3)
 
 
+def _motion_pairs(count: int, max_pairs: int) -> list[tuple[int, int]]:
+    if max_pairs < 1:
+        raise ValueError("max_pairs 必须大于零")
+    pairs = [(index, other) for index in range(count) for other in range(index + 1, count)]
+    return pairs[:: len(pairs) // max_pairs + 1] if len(pairs) > max_pairs else pairs
+
+
 def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
     """一组转轴之间的最大夹角（度）。转轴是双向的，所以正负号不影响结果。
 
@@ -844,79 +855,6 @@ def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:
     gram = np.abs(unit @ unit.T)
     upper = np.triu_indices(len(unit), k=1)
     return float(np.degrees(np.arccos(np.clip(gram[upper], -1.0, 1.0))).max())
-
-
-def _translation_span(poses: Sequence[np.ndarray] | np.ndarray) -> float:
-    """一组位姿的位置跨度（米）：三轴极差组成的包围盒对角线。
-
-    用来把"遥测说机体动了多少"和"PnP 说相机动了多少"并排看——两者本该同量级
-    （只差一个杆臂随姿态转动带来的小量），差一个数量级就是遥测位置不可用的铁证。
-
-    ⚠ 空值判断用 ``poses is None or len(poses) == 0``，**不要写 ``if not poses``**：
-    传进来 ndarray 时后者是"多元素真值判断"歧义，会抛
-    ``ValueError: The truth value of an array with more than one element is ambiguous``。
-    """
-    if poses is None or len(poses) == 0:
-        return 0.0
-    points = np.asarray([pose[:3, 3] for pose in poses], dtype=np.float64)
-    return float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
-
-
-def telemetry_span_ok(body_span_m: float, camera_span_m: float) -> bool:
-    """遥测位置"真的动过、且与画面同量级"吗——杆臂**估计值**的第二道门。
-
-    为什么残差判据不够
-    ------------------
-    平移方程残差 = 右端项 ``b`` 在 ``A = stack(R_a − I)`` 列空间**正交补**上的投影。
-    "遥测位置恒零/几乎不动"带来的右端扰动 ``Δt_a`` 可能落在列空间里，于是最小二乘
-    把它**整体吸收进** ``t_x``：残差可能保持很小，但估计值仍然偏离真实杆臂。因此必须
-    再加一道**与方程无关**的
-    量纲检查：
-
-    * 遥测位置跨度 ≥ :data:`BODY_SPAN_FLOOR_M`（机体得真的动起来）；
-    * 遥测跨度 / 画面跨度落在 [:data:`BODY_SPAN_RATIO_MIN`, :data:`BODY_SPAN_RATIO_MAX`]
-      （两边本该同量级）。
-
-    ⚠ 它是**勤勉性检查，不是证明**：只能抓住"遥测位置恒零/几乎不动"与"两边差一个数量级"
-    这两类，无法验证"遥测位置偏了一半"这种部分造假的中间态。采不到可信位置时的正确做法
-    始终是**重新采集**，或者干脆只用手眼旋转解（``t_bc`` 以尺量为准）。
-    """
-    if not math.isfinite(body_span_m) or not math.isfinite(camera_span_m):
-        return False
-    if body_span_m < BODY_SPAN_FLOOR_M or camera_span_m <= 0.0:
-        return False
-    ratio = body_span_m / camera_span_m
-    return BODY_SPAN_RATIO_MIN <= ratio <= BODY_SPAN_RATIO_MAX
-
-
-def _translation_residual(
-    a_list: Sequence[np.ndarray],
-    b_list: Sequence[np.ndarray],
-    rotation: np.ndarray,
-    translation: np.ndarray | None,
-) -> float:
-    """平移方程 ``(R_a − I)t_x + t_a − R_x t_b`` 的最大残差（米）。
-
-    这是判"遥测位置能不能用"的**两条**判据之一（另一条是 :func:`telemetry_span_ok`）。
-    ``t_a`` 是真是假都解得出一个 ``t_x``（最小二乘照样给你一个数），但假 ``t_a`` 往往会让
-    方程**本身不自洽**：残差涨到与真实位移同量级。所以别只看 ``t_x`` 的大小，要看这个残差。
-
-    ⚠ 但残差**不是充分判据**：它是右端项在 ``A`` 列空间正交补上的投影，而"遥测位置恒零/
-    几乎不动"带来的扰动可以整体落在列空间里——实测残差一位不变（差 2e-17 m）而解偏 0.664 m。
-    那也是 :func:`telemetry_span_ok` 存在的理由（详见 docs/calibration_opencv.md）。
-    """
-    if translation is None:
-        return float("nan")
-    identity = np.eye(3)
-    worst = 0.0
-    for a_matrix, b_matrix in zip(a_list, b_list, strict=True):
-        offset = (
-            (a_matrix[:3, :3] - identity) @ translation
-            + a_matrix[:3, 3]
-            - rotation @ b_matrix[:3, 3]
-        )
-        worst = max(worst, float(np.linalg.norm(offset)))
-    return worst
 
 
 def relative_transform(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -1081,13 +1019,12 @@ def run_extrinsics(
     body_poses: Sequence[np.ndarray] | np.ndarray,  # ndarray（逐帧堆叠）也收
     min_pair_rotation_deg: float = MIN_PAIR_ROTATION_DEG,
     min_axis_spread_deg: float = MIN_AXIS_SPREAD_DEG,
-    estimate_body_translation: bool = True,
     max_pairs: int = MAX_MOTION_PAIRS,
 ) -> ExtrinsicsResult:
     """手眼标定：``board_poses`` 与 ``body_poses`` 必须**逐项同时刻**。
 
     * ``board_poses``：``(时刻, rvec, tvec)``，PnP 给出的 ``T_cam_board``；
-    * ``body_poses``：``T_world_body``（4×4），用 :func:`align_body_poses` 按帧时刻重采样。
+    * ``body_poses``：机体旋转矩阵，用 :func:`align_body_poses` 按帧时刻重采样。
 
     ⚠ 下面两件事都要做到，否则结果没有意义：
     1. **一一对应**：遥测 10 Hz、画面 30 Hz，"第 i 条遥测配第 i 帧"是错的；
@@ -1096,20 +1033,6 @@ def run_extrinsics(
     运动对取所有 ``i < j``（超过 ``max_pairs`` 时按固定步长抽样，保证结果确定），
     ``A`` 用遥测相对运动、``B`` 用 PnP 相对运动；方程与解法见 :func:`solve_hand_eye`。
 
-    平移（杆臂）**照算，但只当校验用**
-    ----------------------------------
-    ``estimate_body_translation=True``（默认）会连 ``t_bc`` 一起解出来——它需要遥测位置
-    ``t_a``，室内手持无 GPS 时不可信，所以这个估计值**不进标定文件**，只用于和尺量值
-    对表。可采信与否交给**两条**判据：
-
-    1. **残差**：``t_bc_reliable`` 要求平移方程残差
-       ≤ ``max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度)``。
-       理由是 ``t_a`` 是真是假**都**解得出一个 ``t_x``（最小二乘照样给数），假 ``t_a``
-       表现在方程不自洽、残差涨到与真实位移同量级；
-    2. **量纲**：:func:`telemetry_span_ok` 要求遥测位置跨度真的动过、且与画面跨度同量级。
-       ⚠ 光靠残差**不够**：残差是右端项在 ``A`` 列空间正交补上的投影，"遥测位置恒零/
-       几乎不动"带来的扰动可以整体落在列空间里——残差一位不变却解偏几十厘米
-       （实测 0.664 m；见 :func:`telemetry_span_ok` 与 docs/calibration_opencv.md）。
     """
     if len(board_poses) != len(body_poses):
         raise ValueError(
@@ -1119,16 +1042,11 @@ def run_extrinsics(
     if len(board_poses) < 3:
         raise ValueError(f"位姿太少（{len(board_poses)} < 3），至少需要 3 个不同位姿")
 
-    candidates = [
-        (index, other)
-        for index in range(len(board_poses))
-        for other in range(index + 1, len(board_poses))
-    ]
-    if len(candidates) > max_pairs:
-        stride = len(candidates) // max_pairs + 1
-        candidates = candidates[::stride]
+    candidates = _motion_pairs(len(board_poses), max_pairs)
 
-    body_inverse = [np.linalg.inv(pose) for pose in body_poses]
+    if any(np.asarray(pose).shape != (3, 3) for pose in body_poses):
+        raise ValueError("机体旋转必须为 3×3 矩阵")
+    body_inverse = [pose.T for pose in body_poses]
     camera_pose = [_pose_matrix(rvec, tvec) for _, rvec, tvec in board_poses]
     camera_inverse = [np.linalg.inv(item) for item in camera_pose]
 
@@ -1147,9 +1065,7 @@ def run_extrinsics(
             f"有效运动对不足（{len(a_list)} < 3）：旋转激励不够。采集时要让飞机绕**多根轴**"
             "都转起来（俯仰/横滚/偏航），全程只平移是解不出来的"
         )
-    rotation, translation, relative_sv, axis_spread = solve_hand_eye(
-        a_list, b_list, use_translation=estimate_body_translation
-    )
+    rotation, _, relative_sv, axis_spread = solve_hand_eye(a_list, b_list, use_translation=False)
     if axis_spread < min_axis_spread_deg:
         raise ValueError(
             f"相对旋转轴过于单一（最大张角 {axis_spread:.1f}° < {min_axis_spread_deg}°）："
@@ -1162,88 +1078,55 @@ def run_extrinsics(
         for a_matrix, b_matrix in zip(a_list[:50], b_list[:50], strict=True)
     ]
     mean_residual = float(np.mean(residuals)) if residuals else float("nan")
-    body_span = _translation_span(body_poses)
-    camera_span = _translation_span(camera_pose)
-    translation_residual = _translation_residual(a_list, b_list, rotation, translation)
-    tolerance = lever_arm_tolerance(camera_span)
-    span_ok = telemetry_span_ok(body_span, camera_span)
     return ExtrinsicsResult(
         r_bc=rotation,
-        t_bc=translation,
         pairs=len(a_list),
         residual_rotation_deg=mean_residual,
         axis_spread_deg=axis_spread,
-        t_bc_reliable=(translation is not None and translation_residual <= tolerance and span_ok),
-        residual_translation_m=translation_residual,
-        body_span_m=body_span,
-        camera_span_m=camera_span,
-        body_span_ok=span_ok,
         methods={"horaud": mean_residual, "relative_singular": relative_sv},
     )
 
 
-def lever_arm_tolerance(camera_span_m: float) -> float:
-    """杆臂**估计值**的采信门限（米）：平移残差不超过它才算可信。
-
-    门限随实际运动量放大（``LEVER_ARM_RESIDUAL_RATIO × 画面平移跨度``），因为残差本身
-    是"米"，与动得多少直接相关；动得很小时用 ``LEVER_ARM_RESIDUAL_FLOOR_M`` 兜底。
-    """
-    return max(LEVER_ARM_RESIDUAL_FLOOR_M, LEVER_ARM_RESIDUAL_RATIO * camera_span_m)
-
-
-def lever_arm_report(
-    result: ExtrinsicsResult | None,
-    measured: Sequence[float] | None = None,
-) -> dict[str, Any]:
-    """杆臂记录：**以尺量为准**，同时给出标定估计值供对比校验。
-
-    估计值来自 :func:`solve_hand_eye` 的平移分支，需要遥测位置 ``t_a``；室内手持采集
-    没有 GPS 时它不可信，所以估计值**不进**标定结果的 ``t_bc`` 字段（georef 读的是尺量
-    值），只写进 ``meta`` 供人核对：两者应当同量级、逐轴接近，``delta_m`` 是欧氏距离。
-    差得离谱正是"遥测位置不可用"的证据——此时 ``estimated_reliable`` 也会是 False。
-
-    ``measured=None`` 时取 :data:`MEASURED_T_BC`——**在调用时取**，不是定义时绑定：
-    那个常量是给人改的，写进默认参数会让"改了常量、报告里还是旧值"。
-    """
-    measured_list = [float(value) for value in (MEASURED_T_BC if measured is None else measured)]
-    report: dict[str, Any] = {
-        "authoritative": measured_list,
-        "source": "measured",
-        "estimated": None,
-        "delta_xyz_m": None,
-        "delta_m": None,
-        "estimated_reliable": False,
-        "residual_translation_m": None,
-        "residual_tolerance_m": None,
-        "body_span_m": None,
-        "camera_span_m": None,
-        "span_ratio": None,
-        "body_span_ok": False,
-        "note": (
-            "t_bc 以尺量为准（手持采集时遥测位置不可信）；"
-            "estimated 仅供对比校验，判据有两条：平移方程残差自洽 + 遥测位置真的动过"
-            "且与画面跨度同量级（body_span_ok）。差得离谱即说明遥测位置不可用"
-        ),
-    }
-    if result is None or result.t_bc is None:
-        return report
-    estimated = np.asarray(result.t_bc, dtype=np.float64).reshape(3)
-    delta = estimated - np.asarray(measured_list, dtype=np.float64)
-    report.update(
-        estimated=estimated.tolist(),
-        delta_xyz_m=[float(value) for value in delta],
-        delta_m=float(np.linalg.norm(delta)),
-        estimated_reliable=bool(result.t_bc_reliable),
-        residual_translation_m=float(result.residual_translation_m),
-        residual_tolerance_m=lever_arm_tolerance(result.camera_span_m),
-        body_span_m=float(result.body_span_m),
-        camera_span_m=float(result.camera_span_m),
-        span_ratio=(
-            float(result.body_span_m / result.camera_span_m) if result.camera_span_m > 0 else None
-        ),
-        body_span_ok=bool(result.body_span_ok),
+def estimate_translation_fixed_rotation(
+    board_poses: Sequence[tuple[float, np.ndarray, np.ndarray]],
+    body_poses: Sequence[np.ndarray],
+    r_bc: np.ndarray,
+    *,
+    max_pairs: int = MAX_MOTION_PAIRS,
+) -> tuple[np.ndarray, float, int]:
+    """固定已标定旋转，以同时刻的棋盘格与机体位姿求平移供人工对比。"""
+    if len(board_poses) != len(body_poses) or len(board_poses) < 3:
+        raise ValueError("translation_samples_insufficient")
+    if any(np.asarray(pose).shape != (4, 4) for pose in body_poses):
+        raise ValueError("机体位姿必须为 4×4 矩阵")
+    candidates = _motion_pairs(len(board_poses), max_pairs)
+    body_inverse = [np.linalg.inv(pose) for pose in body_poses]
+    camera_pose = [_pose_matrix(rvec, tvec) for _, rvec, tvec in board_poses]
+    camera_inverse = [np.linalg.inv(pose) for pose in camera_pose]
+    relative_body: list[np.ndarray] = []
+    relative_camera: list[np.ndarray] = []
+    for i, j in candidates:
+        body_relative = body_inverse[j] @ body_poses[i]
+        relative_body.append(body_relative)
+        relative_camera.append(camera_pose[j] @ camera_inverse[i])
+    if not relative_body:
+        raise ValueError("translation_samples_insufficient")
+    matrix = np.vstack([item[:3, :3] - np.eye(3) for item in relative_body])
+    rhs = np.concatenate(
+        [
+            r_bc @ camera[:3, 3] - body[:3, 3]
+            for body, camera in zip(relative_body, relative_camera, strict=True)
+        ]
     )
-    return report
+    if not np.isfinite(matrix).all() or not np.isfinite(rhs).all():
+        raise ValueError("translation_input_non_finite")
+    translation, _, rank, _ = np.linalg.lstsq(matrix, rhs, rcond=None)
+    if rank < 3:
+        raise ValueError("translation_geometry_rank_deficient")
+    if not np.isfinite(translation).all():
+        raise ValueError("translation_solution_non_finite")
+    residual = float(np.sqrt(np.mean((matrix @ translation - rhs) ** 2)))
+    return translation, residual, len(relative_body)
 
 
 def _pose_matrix(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:

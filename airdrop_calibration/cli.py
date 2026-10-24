@@ -90,6 +90,13 @@ SUBCOMMANDS = {
                 kind="flag",
                 source="STRICT",
             ),
+            Option(
+                ("--estimate-translation",),
+                "estimate_translation",
+                "使用位置源时标对表平移外参",
+                kind="bool",
+                source="ESTIMATE_TRANSLATION",
+            ),
         ),
     )
 }

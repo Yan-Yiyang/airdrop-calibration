@@ -8,6 +8,7 @@
 | 帧索引 | `filename` | 相对 `frames/` 的路径；拒绝越界路径和越界符号链接 |
 | 帧索引 | `received_timestamp` | 收到画面的原始时刻，秒；标定的主要时间轴 |
 | 帧索引 | `capture_timestamp`、`lag` | 录制时推定的拍摄时刻与当时配置延时，秒；供残差互核 |
+| 帧索引 | `telemetry_aligned` | 地面标定原始帧为 false，不附带同帧位置或姿态；由独立四元数日志离线配对 |
 | 遥测 | `timestamp` | 本机墙钟的快照组装时刻，秒；只用于整理记录，不作为姿态采样时刻 |
 | 遥测 | `north_m`、`east_m`、`down_m` | 局部 NED 位置，米；缺少任一位置分量时不构造完整机体位姿 |
 | 遥测 | `quaternion_w/x/y/z` | 机体 FRD → 局部 NED，顺序为 wxyz；缺失姿态不补零 |
@@ -18,7 +19,9 @@
 帧索引缺少 `received_timestamp` 会失败，不能悄悄改用推定拍摄时刻。坏图像连同它自己的时间记录
 一起跳过。读取与报告由工具自己的 DTO 和模块负责，不依赖运行包的快照或 `FlightLog` 类。
 
-生产标定要求各字段原始源时标与接收时刻，按源时标去重四元数，以其 `quaternion_received_at` 建立时间参照；位置按源时刻内插。缺少原始时标、跨重启或姿态断流时明确失败，不能沿用合并快照的 `timestamp` 猜测。
+地面生产标定要求四元数原始源时标与接收时刻，按源时标去重，以 `quaternion_received_at` 建立时间参照并插值旋转；位置缺失或位置时钟异常不阻断它。完整位姿诊断接口才读取和内插位置。缺少四元数原始时标、跨重启或姿态断流时明确失败，不能沿用合并快照的 `timestamp` 猜测。
+
+`config_snapshot.json` 中 `record.telemetry_hz=0` 的全量记录必须有完整收尾事件、无丢失或写入错误，并与实际遥测行数、帧索引和可解码图像一致；损坏数据明确失败，不采用普通读取器的跳过语义。
 
 ## 标定或模型参数 → 相机文件
 
@@ -28,14 +31,16 @@
 | --- | --- |
 | `camera_matrix` | 3×3 内参矩阵，像素；`image_size` 为 `[width, height]` |
 | `dist_coeffs` | OpenCV 顺序的无量纲畸变系数；仿真相机为零 |
-| `R_bc` | OpenCV optical（右、下、前）→ 机体 FRD（前、右、下） |
+| `R_bc` | OpenCV optical（右、下、前）→ 机体 FRD（前、右、下）；求解失败为 null，不能作为已标定相机加载 |
 | `t_bc` | 光心在机体系中的位置，米 |
 | `telemetry_lag` | 帧接收时刻相对四元数接收参照的有效对齐量，秒；无有效估计时为 null |
 
 标定报告在 `meta` 中记录版本、来源、单位、坐标约定及内参/时间差/手眼质量信息。
-`t_bc` 的权威值仍为尺量值，手眼估计杆臂用于对表。来源标注必须区分实际标定结果与
+`t_bc` 始终使用尺量值；地面旋转标定先仅以四元数估计 `R_bc` 和延迟，默认可选地用位置源时标诊断平移杆臂，`--no-estimate-translation` 可关闭。
+该估计固定已求得的旋转，在 `meta.translation_diagnostic` 展示估计值、尺量值、逐轴差和差值距离供人工对比，不写入 `t_bc`，不作位置可信度判断。
+`meta.translation_diagnostic` 记录 `status`、`reason`、`measured`、`estimated`、`delta_xyz_m`、`delta_m`、`residual_m` 和 `pairs`。位置不可用或平移方程不可解时给出跳过原因。来源标注必须区分实际标定结果与
 `CameraConfig` 推导的模拟参数；模型推导值不代表实测相机或链路已经标定。
-运行包读取既有顶层字段，新增元数据不改变旧文件的读兼容。
+运行包要求有效的 `R_bc`，缺失或 null 不按默认安装角认定为已标定。
 
 ## 仿真配置 → SDF、相机文件与 manifest
 

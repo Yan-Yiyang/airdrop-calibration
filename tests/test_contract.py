@@ -30,11 +30,11 @@ class BlockAirdrop(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, BlockAirdrop())
-from airdrop_calibration import calibrate
+from airdrop_calibration import algorithms
 import airdrop_calibration.algorithms
 import airdrop_calibration.flight_log
 import airdrop_calibration.report
-assert calibrate.rotation_z(90).shape == (3, 3)
+assert algorithms.rotation_z(90).shape == (3, 3)
 assert not any(name == 'airdrop' or name.startswith('airdrop.') for name in sys.modules)
 assert 'cv2' not in sys.modules
 """

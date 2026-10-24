@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-from .algorithms import lever_arm_report, rotation_z
 from .models import ExtrinsicsResult, IntrinsicsResult, LagMeasurement, LagResult
 from .settings import LAG_CROSS_CHECK_TOL_S, MEASURED_T_BC, TIME_BASE_RECEIVED
 
@@ -27,15 +26,17 @@ def build_calibration_report(
     lag_step_s: float,
     measured_t_bc: Sequence[float] = MEASURED_T_BC,
     source: CalibrationSource = "measured_calibration",
+    telemetry_quality: Mapping[str, Any] | None = None,
+    translation_diagnostic: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """构建标定文件；旧版 CameraModel 所需顶层键保持不变。"""
+    """构建标定文件；未求得的旋转外参明确记为 null。"""
     if source not in ("measured_calibration", "simulated_calibration"):
         raise ValueError(f"未知标定来源: {source!r}")
     return {
         "camera_matrix": intrinsics.camera_matrix.tolist(),
         "dist_coeffs": intrinsics.dist_coeffs.tolist(),
         "image_size": list(intrinsics.image_size),
-        "R_bc": extrinsics.r_bc.tolist() if extrinsics is not None else rotation_z(90.0).tolist(),
+        "R_bc": extrinsics.r_bc.tolist() if extrinsics is not None else None,
         "t_bc": [float(value) for value in measured_t_bc],
         "telemetry_lag": float(lag.lag_s) if lag.ok else None,
         "meta": {
@@ -88,17 +89,19 @@ def build_calibration_report(
             },
             "extrinsics": (
                 {
+                    "mode": "rotation_only",
                     "pairs": extrinsics.pairs,
                     "residual_rotation_deg": extrinsics.residual_rotation_deg,
                     "axis_spread_deg": extrinsics.axis_spread_deg,
                     "t_bc_source": "measured",
-                    "lever_arm": lever_arm_report(extrinsics, measured=measured_t_bc),
                     "methods": extrinsics.methods,
-                    "note": "R_bc 由标定估计，t_bc 使用尺量值；杆臂估计仅用于对比校验",
+                    "note": "R_bc 由姿态旋转估计，t_bc 使用尺量值",
                 }
                 if extrinsics is not None
                 else None
             ),
             "source_dir": str(flight_dir),
+            "translation_diagnostic": dict(translation_diagnostic),
+            **({"telemetry_quality": dict(telemetry_quality)} if telemetry_quality else {}),
         },
     }

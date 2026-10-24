@@ -5,12 +5,34 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
 TIME_BASE_RECEIVED = "received"
 TIME_BASE_CAPTURE = "capture"
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except TypeError, ValueError, OverflowError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _integer_timestamp(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+        if not math.isfinite(result) or not result.is_integer():
+            return None
+        return int(result)
+    except TypeError, ValueError, OverflowError:
+        return None
 
 
 class TelemetryLike(Protocol):
@@ -66,30 +88,40 @@ class Telemetry:
             raise ValueError("遥测 timestamp 必须是有限数值")
         object.__setattr__(self, "timestamp", timestamp)
         for name in (
-            "north_m",
-            "east_m",
-            "down_m",
             "quaternion_w",
             "quaternion_x",
             "quaternion_y",
             "quaternion_z",
             "quaternion_received_at",
-            "position_velocity_received_at",
         ):
             value = getattr(self, name)
             if value is not None:
-                if isinstance(value, bool):
-                    raise ValueError(f"遥测 {name} 必须是有限数值")
-                number = float(value)
-                if not math.isfinite(number):
+                number = _finite_float(value)
+                if number is None:
                     raise ValueError(f"遥测 {name} 必须是有限数值")
                 object.__setattr__(self, name, number)
-        for name in ("quaternion_timestamp_us", "position_timestamp_us"):
-            value = getattr(self, name)
-            if value is not None:
-                if isinstance(value, bool) or not math.isfinite(value) or int(value) != value:
-                    raise ValueError(f"遥测 {name} 必须是整数源时标")
-                object.__setattr__(self, name, int(value))
+        value = self.quaternion_timestamp_us
+        if value is not None:
+            parsed_timestamp = _integer_timestamp(value)
+            if parsed_timestamp is None:
+                raise ValueError("遥测 quaternion_timestamp_us 必须是整数源时标")
+            object.__setattr__(self, "quaternion_timestamp_us", parsed_timestamp)
+        value = self.position_timestamp_us
+        if value is not None:
+            object.__setattr__(self, "position_timestamp_us", _integer_timestamp(value))
+        received = self.position_velocity_received_at
+        if received is not None:
+            object.__setattr__(self, "position_velocity_received_at", _finite_float(received))
+        position_fields = ("north_m", "east_m", "down_m")
+        position = tuple(_finite_float(getattr(self, name)) for name in position_fields)
+        if all(value is not None for value in position):
+            for name, value in zip(position_fields, position, strict=True):
+                object.__setattr__(self, name, value)
+        else:
+            object.__setattr__(self, "north_m", None)
+            object.__setattr__(self, "east_m", None)
+            object.__setattr__(self, "down_m", None)
+            object.__setattr__(self, "position_velocity_received_at", None)
 
     def is_valid(self) -> bool:
         """存在位置或姿态观测时返回真。"""
@@ -159,15 +191,9 @@ class LagMeasurement:
 @dataclass
 class ExtrinsicsResult:
     r_bc: np.ndarray
-    t_bc: np.ndarray | None
     pairs: int
     residual_rotation_deg: float
     axis_spread_deg: float = 0.0
-    t_bc_reliable: bool = False
-    residual_translation_m: float = float("nan")
-    body_span_m: float = 0.0
-    camera_span_m: float = 0.0
-    body_span_ok: bool = False
     methods: dict[str, float] = field(default_factory=dict)
 
     @property

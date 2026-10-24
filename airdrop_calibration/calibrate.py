@@ -1,9 +1,10 @@
-"""相机标定兼容入口：保留配置、三步工作流与历史公开函数。"""
+"""相机标定三步工作流与命令行配置。"""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,198 +14,75 @@ import numpy as np
 
 from .algorithms import (
     align_body_poses,
-    angular_speed_from_poses,
     board_object_points,
-    body_pose_matrix,
-    detect_corners,
-    estimate_lag_by_correlation,
-    lever_arm_tolerance,
-    look_at_board,
+    estimate_translation_fixed_rotation,
     measure_frame_telemetry_lag,
-    pattern_phase_ok,
-    quaternion_to_matrix_local,
-    relative_transform,
-    render_board,
-    rotation_angle_deg,
-    rotation_log,
-    rotation_x,
-    rotation_y,
-    rotation_z,
     run_extrinsics,
     run_intrinsics,
     solve_board_poses,
-    solve_hand_eye,
-    telemetry_pose_at,
-    telemetry_span_ok,
 )
-from .algorithms import lever_arm_report as _lever_arm_report
-from .flight_log import (
-    load_flight_frames_paired,
-    load_flight_index,
-    load_flight_stamps,
-    load_flight_telemetry,
-    load_flight_timestamps,
-)
-from .models import (
-    ExtrinsicsResult,
-    FrameStamp,
-    IntrinsicsResult,
-    LagMeasurement,
-    LagResult,
-    Telemetry,
-    TelemetryLike,
-)
-from .report import (
-    SCHEMA_VERSION,
-    CalibrationSource,
-    build_calibration_report,
-)
+from .flight_log import _frame_path, load_flight_frames_paired, load_flight_telemetry
+from .models import ExtrinsicsResult, LagMeasurement, LagResult, Telemetry
+from .report import CalibrationSource, build_calibration_report
 from .settings import (
-    BODY_SPAN_FLOOR_M,
-    BODY_SPAN_RATIO_MAX,
-    BODY_SPAN_RATIO_MIN,
+    ESTIMATE_TRANSLATION,
     FLIGHT_DIR,
     LAG_CROSS_CHECK_TOL_S,
     LAG_SEARCH_S,
     LAG_STEP_S,
-    LEVER_ARM_RESIDUAL_FLOOR_M,
-    LEVER_ARM_RESIDUAL_RATIO,
     MAX_FRAMES,
     MAX_MOTION_PAIRS,
-    MAX_VIEWS,
     MEASURED_T_BC,
-    MIN_AXIS_SPREAD_DEG,
-    MIN_PAIR_ROTATION_DEG,
-    MIN_VIEWS,
     OUTPUT_PATH,
     PATTERN_SIZE,
     SQUARE_SIZE_M,
     STRICT,
-    TIME_BASE_CAPTURE,
-    TIME_BASE_RECEIVED,
 )
 from .source_timeline import SourceTimeline
 
 LOGGER = logging.getLogger("calibrate")
 
-__all__ = [
-    "BODY_SPAN_FLOOR_M",
-    "BODY_SPAN_RATIO_MAX",
-    "BODY_SPAN_RATIO_MIN",
-    "FLIGHT_DIR",
-    "LAG_CROSS_CHECK_TOL_S",
-    "LAG_SEARCH_S",
-    "LAG_STEP_S",
-    "LEVER_ARM_RESIDUAL_FLOOR_M",
-    "LEVER_ARM_RESIDUAL_RATIO",
-    "MAX_FRAMES",
-    "MAX_MOTION_PAIRS",
-    "MAX_VIEWS",
-    "MEASURED_T_BC",
-    "MIN_AXIS_SPREAD_DEG",
-    "MIN_PAIR_ROTATION_DEG",
-    "MIN_VIEWS",
-    "OUTPUT_PATH",
-    "PATTERN_SIZE",
-    "SCHEMA_VERSION",
-    "SQUARE_SIZE_M",
-    "STRICT",
-    "TIME_BASE_CAPTURE",
-    "TIME_BASE_RECEIVED",
-    "CalibrateConfig",
-    "CalibrationSource",
-    "ExtrinsicsResult",
-    "FrameStamp",
-    "IntrinsicsResult",
-    "LagMeasurement",
-    "LagResult",
-    "Telemetry",
-    "TelemetryLike",
-    "align_body_poses",
-    "angular_speed_from_poses",
-    "board_object_points",
-    "body_pose_matrix",
-    "build_calibration_report",
-    "build_config",
-    "calibrate",
-    "detect_corners",
-    "estimate_lag_by_correlation",
-    "lever_arm_report",
-    "lever_arm_tolerance",
-    "load_flight_frames_paired",
-    "load_flight_index",
-    "load_flight_stamps",
-    "load_flight_telemetry",
-    "load_flight_timestamps",
-    "look_at_board",
-    "main",
-    "measure_frame_telemetry_lag",
-    "pattern_phase_ok",
-    "quaternion_to_matrix_local",
-    "relative_transform",
-    "render_board",
-    "rotation_angle_deg",
-    "rotation_log",
-    "rotation_x",
-    "rotation_y",
-    "rotation_z",
-    "run_extrinsics",
-    "run_intrinsics",
-    "solve_board_poses",
-    "solve_hand_eye",
-    "telemetry_pose_at",
-    "telemetry_span_ok",
-]
 
-
-def lever_arm_report(
-    result: ExtrinsicsResult | None,
-    measured: Sequence[float] | None = None,
+def _translation_diagnostic(
+    *,
+    status: str,
+    reason: str | None,
+    estimated: np.ndarray | None,
+    residual: float | None,
+    pairs: int,
+    measured: Sequence[float],
 ) -> dict[str, Any]:
-    """报告尺量杆臂；默认值按调用时的兼容入口常量读取。"""
-    return _lever_arm_report(result, MEASURED_T_BC if measured is None else measured)
+    measured_values = [float(value) for value in measured]
+    estimate_values = None if estimated is None else estimated.astype(float).tolist()
+    delta = None if estimated is None else estimated - np.asarray(measured_values)
+    return {
+        "status": status,
+        "reason": reason,
+        "measured": measured_values,
+        "estimated": estimate_values,
+        "delta_xyz_m": None if delta is None else delta.tolist(),
+        "delta_m": None if delta is None else float(np.linalg.norm(delta)),
+        "residual_m": residual,
+        "pairs": pairs,
+    }
 
 
-def _log_lever_arm(arm: dict[str, Any]) -> None:
-    """记录杆臂估计及其可信度判据。"""
-    if arm["estimated"] is None:
-        LOGGER.info("  杆臂按尺量: t_bc=%s（未估）", list(MEASURED_T_BC))
+def _log_translation_diagnostic(diagnostic: dict[str, Any]) -> None:
+    if diagnostic["estimated"] is None:
+        LOGGER.info(
+            "  平移对比%s", f"跳过：{diagnostic['reason']}" if diagnostic["reason"] else "已关闭"
+        )
         return
     LOGGER.info(
-        "  杆臂：尺量 %s，标定估计 %s，差 %.3f m",
-        [round(value, 4) for value in arm["authoritative"]],
-        [round(value, 4) for value in arm["estimated"]],
-        arm["delta_m"],
-    )
-    if arm["estimated_reliable"]:
-        LOGGER.info(
-            "  估计值可采信（平移残差 %.4f m 在 %.4f m 以内；遥测位置跨度 %.2f m vs 画面 %.2f m）",
-            arm["residual_translation_m"],
-            arm["residual_tolerance_m"],
-            arm["body_span_m"],
-            arm["camera_span_m"],
-        )
-        return
-    reasons = []
-    if arm["residual_translation_m"] > arm["residual_tolerance_m"]:
-        reasons.append(
-            f"平移残差 {arm['residual_translation_m']:.4f} m 超出 "
-            f"{arm['residual_tolerance_m']:.4f} m"
-        )
-    if not arm["body_span_ok"]:
-        reasons.append(
-            f"遥测位置跨度 {arm['body_span_m']:.3f} m 不合格（画面 {arm['camera_span_m']:.3f} m，"
-            f"下限 {BODY_SPAN_FLOOR_M} m、比值需在 [{BODY_SPAN_RATIO_MIN}, {BODY_SPAN_RATIO_MAX}] 内）"
-        )
-    LOGGER.warning(
-        "  估计值不可信（%s）——室内手持无 GPS 时遥测位置不可用，以尺量值 %s 为准；"
-        "遥测位置几乎不动时残差也可能是干净的",
-        "；".join(reasons) or "未知原因",
-        list(MEASURED_T_BC),
+        "  平移对比（机体 FRD，m）：尺量 %s，估计 %s，逐轴差 %s，距离差 %.4f m",
+        diagnostic["measured"],
+        diagnostic["estimated"],
+        diagnostic["delta_xyz_m"],
+        diagnostic["delta_m"],
     )
 
 
-def calibrate(
+def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
     flight_dir: Path,
     *,
     pattern_size: tuple[int, int] = PATTERN_SIZE,
@@ -213,10 +91,13 @@ def calibrate(
     lag_step_s: float = LAG_STEP_S,
     max_frames: int = MAX_FRAMES,
     source: CalibrationSource = "measured_calibration",
+    estimate_translation: bool = ESTIMATE_TRANSLATION,
 ) -> dict[str, Any]:
     """跑完三步，返回可写入 ``camera_calib.json`` 的字典。"""
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
 
+    telemetry_rows = load_flight_telemetry(flight_dir)
+    capture_quality = _validate_full_update_capture(flight_dir, telemetry_rows)
     LOGGER.info("读取标定素材: %s", flight_dir)
     paired = load_flight_frames_paired(flight_dir, max_frames)
     if not paired:
@@ -259,9 +140,8 @@ def calibrate(
     pose_times_capture: list[float] = []
     board_poses: list[tuple[float, np.ndarray, np.ndarray]] = []
     rejected = 0
-    # 用 solve_board_poses（含相邻帧连续性定支）而不是裸 solvePnP：
-    # 检测器的角点顺序可能与我们枚举的对象点相反，单帧无法分辨（见其 docstring），
-    # 而**混用两种标签**会让第三步残差飙到几十度。
+    # 用 solve_board_poses 的单帧黑白相位判向：标定棋盘列行奇偶相反时，
+    # 正反候选相位相反；相同奇偶的尺寸会在该函数入口明确拒绝。
     for stamp, pose in zip(
         [record for record, _ in paired],
         solve_board_poses(
@@ -287,7 +167,10 @@ def calibrate(
         LOGGER.warning("  丢弃 %d 帧（角点检不出）", rejected)
 
     # BUG：合并快照 timestamp 不是四元数采样/接收时刻，会把其它字段更新延迟混入标定。
-    timeline = SourceTimeline(load_flight_telemetry(flight_dir))
+    timeline = SourceTimeline(telemetry_rows, include_position=False)
+    telemetry_quality: dict[str, Any] = {"source_timeline": timeline.quality_meta}
+    if capture_quality is not None:
+        telemetry_quality["capture"] = capture_quality
     snapshots = timeline.attitudes
     measurement = LagMeasurement(
         absolute=LagResult(lag_s=0.0, peak=float("nan"), samples=0),
@@ -333,11 +216,15 @@ def calibrate(
     # ---- 步骤三 ----
     LOGGER.info("步骤三：手眼外参")
     extrinsics: ExtrinsicsResult | None = None
+    translation_status = "disabled" if not estimate_translation else "skipped"
+    translation_reason = "disabled_by_user" if not estimate_translation else "not_run"
+    translation_estimate: np.ndarray | None = None
+    translation_residual: float | None = None
+    translation_pairs = 0
+
     if board_poses and len(snapshots) >= 2 and lag.ok:
-        # 与画面**同时刻**的机体位姿：遥测 10 Hz、画面 30 Hz，
-        # 直接把"第 i 条遥测"配给"第 i 帧"是错的，必须按帧时刻重采样
         paired_board, paired_body = align_body_poses(
-            board_poses, snapshots, lag_s=lag.lag_s, pose_at=timeline.pose_at
+            board_poses, snapshots, lag_s=lag.lag_s, pose_at=timeline.rotation_at
         )
         dropped = len(board_poses) - len(paired_board)
         if dropped:
@@ -350,12 +237,47 @@ def calibrate(
                 extrinsics.residual_rotation_deg,
                 extrinsics.axis_spread_deg,
             )
-            # 杆臂：**尺量为准**（写进标定文件的是它），标定估计值只用来对表
-            _log_lever_arm(lever_arm_report(extrinsics, measured=MEASURED_T_BC))
+            if estimate_translation:
+                try:
+                    position_timeline = SourceTimeline(telemetry_rows)
+                    position_board: list[tuple[float, np.ndarray, np.ndarray]] = []
+                    position_body: list[np.ndarray] = []
+                    for board_pose in paired_board:
+                        body = position_timeline.pose_at(board_pose[0] - lag.lag_s)
+                        if body is not None:
+                            position_board.append(board_pose)
+                            position_body.append(body)
+                    (
+                        translation_estimate,
+                        translation_residual,
+                        translation_pairs,
+                    ) = estimate_translation_fixed_rotation(
+                        position_board,
+                        position_body,
+                        extrinsics.r_bc,
+                        max_pairs=MAX_MOTION_PAIRS,
+                    )
+                    translation_status, translation_reason = "estimated", None
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    translation_reason = str(exc)
         except ValueError as exc:
             LOGGER.warning("  手眼标定失败: %s", exc)
+            if estimate_translation:
+                translation_reason = f"rotation_estimation_failed: {exc}"
     else:
         LOGGER.warning("  缺少棋盘格/遥测位姿或有效时间差，跳过外参")
+        if estimate_translation:
+            translation_reason = "rotation_or_time_alignment_unavailable"
+
+    diagnostic = _translation_diagnostic(
+        status=translation_status,
+        reason=translation_reason,
+        estimated=translation_estimate,
+        residual=translation_residual,
+        pairs=translation_pairs,
+        measured=MEASURED_T_BC,
+    )
+    _log_translation_diagnostic(diagnostic)
 
     return build_calibration_report(
         intrinsics=intrinsics,
@@ -369,7 +291,106 @@ def calibrate(
         lag_step_s=lag_step_s,
         measured_t_bc=MEASURED_T_BC,
         source=source,
+        telemetry_quality=telemetry_quality,
+        translation_diagnostic=diagnostic,
     )
+
+
+def _validate_full_update_capture(
+    flight_dir: Path, telemetry: Sequence[Telemetry]
+) -> dict[str, Any] | None:
+    """对标定 profile 的记录做 fail-closed 完整性核验。"""
+    config_path = flight_dir / "config_snapshot.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("record", {}).get("telemetry_hz") != 0:
+        return None
+
+    event_path = flight_dir / "events.jsonl"
+    events = [
+        json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines() if line
+    ]
+    if not events or events[-1].get("kind") != "recorder_stopped":
+        raise ValueError("标定全量记录缺少 recorder_stopped 收尾事件")
+    stopped = events[-1]
+    counts = {
+        name: stopped.get(name)
+        for name in (
+            "telemetry_received",
+            "telemetry_enqueued",
+            "telemetry_written",
+            "telemetry_dropped",
+            "telemetry_write_errors",
+            "telemetry_pending",
+            "frame_encode_errors",
+            "finalize_errors",
+        )
+    }
+    if (
+        counts["telemetry_received"] != counts["telemetry_enqueued"]
+        or counts["telemetry_enqueued"] != counts["telemetry_written"]
+        or counts["telemetry_dropped"] != 0
+        or counts["telemetry_write_errors"] != 0
+        or counts["telemetry_pending"] != 0
+        or counts["frame_encode_errors"] != 0
+        or counts["finalize_errors"] != 0
+    ):
+        raise ValueError(f"标定全量遥测队列不完整: {counts}")
+    if stopped.get("frames_skipped") != 0:
+        raise ValueError(f"标定全量记录有帧丢失: frames_skipped={stopped['frames_skipped']}")
+    if stopped.get("events") != len(events) - 1:
+        raise ValueError("标定 events.jsonl 行数与 recorder_stopped 统计不一致")
+
+    telemetry_path = flight_dir / "telemetry.jsonl"
+    with telemetry_path.open(encoding="utf-8") as telemetry_file:
+        raw_lines = sum(bool(line.strip()) for line in telemetry_file)
+    if raw_lines != counts["telemetry_written"] or len(telemetry) != raw_lines:
+        raise ValueError(
+            "标定 telemetry.jsonl 行数、有效 DTO 数与 writer 统计不一致: "
+            f"lines={raw_lines}, dto={len(telemetry)}, written={counts['telemetry_written']}"
+        )
+
+    frames_path = flight_dir / "frames_index.jsonl"
+    frames = [
+        json.loads(line) for line in frames_path.read_text(encoding="utf-8").splitlines() if line
+    ]
+    if len(frames) != stopped.get("frames_written") or len(frames) < 2:
+        raise ValueError("标定帧索引与 recorder_stopped 统计不一致，或有效帧不足")
+    import cv2  # 惰性导入：完整性检查只在离线标定时加载 OpenCV
+
+    frame_times: list[float] = []
+    frames_dir = flight_dir / "frames"
+    for item in frames:
+        try:
+            timestamp = float(item["received_timestamp"])
+            filename = str(item["filename"])
+            expected_bytes = int(item["bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("标定帧索引缺少有效时间戳、文件名或字节数") from exc
+        if not math.isfinite(timestamp) or (frame_times and timestamp <= frame_times[-1]):
+            raise ValueError("标定帧接收时间戳必须有限且严格递增")
+        try:
+            path = _frame_path(frames_dir, filename)
+        except ValueError as exc:
+            raise ValueError(f"标定帧索引包含非法文件名: {filename}") from exc
+        try:
+            encoded = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"标定帧文件缺失或不可读: {filename}") from exc
+        if (
+            len(encoded) != expected_bytes
+            or cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR) is None
+        ):
+            raise ValueError(f"标定帧文件长度不符或无法解码: {filename}")
+        frame_times.append(timestamp)
+    span = frame_times[-1] - frame_times[0]
+    return {
+        "scope": "process_accepted_samples",
+        "telemetry": counts,
+        "frame_count": len(frames),
+        "frame_hz": (len(frames) - 1) / span,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +411,7 @@ class CalibrateConfig:
     #: 严格模式：外参/时间差没标出来时返回非 0（默认只警告，照样写文件）
     strict: bool = STRICT
     source: CalibrationSource = "measured_calibration"
+    estimate_translation: bool = ESTIMATE_TRANSLATION
 
 
 def build_config(**overrides) -> CalibrateConfig:
@@ -421,6 +443,7 @@ def main(**overrides) -> int:
         lag_step_s=settings.lag_step_s,
         max_frames=settings.max_frames,
         source=settings.source,
+        estimate_translation=settings.estimate_translation,
     )
     out_path = Path(settings.output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -433,7 +456,7 @@ def main(**overrides) -> int:
     if payload.get("telemetry_lag") is None:
         problems.append("画面-遥测时间差没有标出来（telemetry_lag=null）")
     if payload["meta"].get("extrinsics") is None:
-        problems.append("手眼外参没有标出来（R_bc 用的是默认值）")
+        problems.append("手眼外参没有标出来（R_bc=null）")
     if problems:
         for item in problems:
             LOGGER.error("严格模式判定标定不合格：%s", item)

@@ -16,39 +16,40 @@ import math
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from airdrop_calibration import calibrate as calibrate_module
-from airdrop_calibration.algorithms import rotation_x, rotation_y, rotation_z
-from airdrop_calibration.calibrate import (
-    MEASURED_T_BC,
-    ExtrinsicsResult,
+import airdrop_calibration.calibrate as calibrate_module
+from airdrop_calibration.algorithms import (
     align_body_poses,
     angular_speed_from_poses,
     board_object_points,
-    calibrate,
     detect_corners,
     estimate_lag_by_correlation,
-    lever_arm_report,
-    lever_arm_tolerance,
+    estimate_translation_fixed_rotation,
     look_at_board,
+    measure_frame_telemetry_lag,
     pattern_phase_ok,
     quaternion_to_matrix_local,
     render_board,
     rotation_angle_deg,
     rotation_log,
+    rotation_x,
+    rotation_y,
+    rotation_z,
     run_extrinsics,
     run_intrinsics,
     solve_board_poses,
     solve_hand_eye,
     telemetry_pose_at,
-    telemetry_span_ok,
 )
+from airdrop_calibration.calibrate import calibrate
 from airdrop_calibration.models import Telemetry as TelemetrySnapshot
+from airdrop_calibration.settings import MEASURED_T_BC
 
 # 真值
 TRUE_FX, TRUE_FY = 900.0, 902.0
@@ -56,7 +57,99 @@ TRUE_CX, TRUE_CY = 640.0, 360.0
 TRUE_SIZE = (1280, 720)
 TRUE_DIST = np.array([-0.12, 0.03, 0.0005, -0.0007, 0.0])
 PATTERN = (7, 5)
+ORIENTABLE_PATTERN = (8, 5)
 SQUARE = 0.03
+
+
+def _bodies_with_real_translation(seed: int, count: int = 14) -> list[np.ndarray]:
+    rng = np.random.default_rng(seed)
+    bodies = []
+    for rotation in _random_rotations(count, seed):
+        body = np.eye(4)
+        body[:3, :3] = rotation
+        body[:3, 3] = rng.normal(scale=0.3, size=3)
+        bodies.append(body)
+    return bodies
+
+
+def _board_poses_from_cameras(
+    cameras: Sequence[np.ndarray],
+) -> list[tuple[float, np.ndarray, np.ndarray]]:
+    return [
+        (float(index), cv2.Rodrigues(pose[:3, :3])[0], pose[:3, 3])
+        for index, pose in enumerate(cameras)
+    ]
+
+
+def test_fixed_rotation_translation_recovers_truth_and_rejects_rank_deficiency() -> None:
+    rotation = rotation_z(23.0) @ rotation_x(-17.0)
+    truth = np.array([0.12, -0.04, 0.08])
+    x_true = np.eye(4)
+    x_true[:3, :3] = rotation
+    x_true[:3, 3] = truth
+    board_world = np.eye(4)
+    board_world[:3, :3] = rotation_y(19.0)
+    board_world[:3, 3] = [2.0, -1.0, 0.5]
+    bodies = _bodies_with_real_translation(27)
+    board = [np.linalg.inv(x_true) @ np.linalg.inv(body) @ board_world for body in bodies]
+    poses = _board_poses_from_cameras(board)
+    estimate, _, pairs = estimate_translation_fixed_rotation(poses, bodies, rotation)
+    assert estimate == pytest.approx(truth, abs=1e-9)
+    assert pairs > 0
+
+    yaw_bodies = []
+    for index in range(6):
+        body = np.eye(4)
+        body[:3, :3] = rotation_z(index * 20.0)
+        body[:3, 3] = [index * 0.1, 0.0, 0.0]
+        yaw_bodies.append(body)
+    yaw_board = [np.linalg.inv(x_true) @ np.linalg.inv(body) @ board_world for body in yaw_bodies]
+    with pytest.raises(ValueError, match="rank_deficient"):
+        estimate_translation_fixed_rotation(
+            _board_poses_from_cameras(yaw_board), yaw_bodies, rotation
+        )
+
+
+def test_fixed_rotation_translation_accepts_two_small_angle_pairs() -> None:
+    rotation = rotation_z(18.0) @ rotation_y(-7.0)
+    truth = np.array([0.12, -0.04, 0.08])
+    x_true = np.eye(4)
+    x_true[:3, :3] = rotation
+    x_true[:3, 3] = truth
+    board_world = np.eye(4)
+    board_world[:3, 3] = [1.5, -0.7, 0.4]
+    bodies = []
+    for index, attitude in enumerate((np.eye(3), rotation_x(2.0), rotation_y(3.0))):
+        body = np.eye(4)
+        body[:3, :3] = attitude
+        body[:3, 3] = [0.2 * index, -0.1 * index, 0.05 * index]
+        bodies.append(body)
+    board = [np.linalg.inv(x_true) @ np.linalg.inv(body) @ board_world for body in bodies]
+    estimate, _, pairs = estimate_translation_fixed_rotation(
+        _board_poses_from_cameras(board), bodies, rotation, max_pairs=2
+    )
+    assert pairs == 2
+    assert estimate == pytest.approx(truth, abs=1e-9)
+
+
+def test_invalid_position_fields_preserve_valid_quaternion() -> None:
+    snapshot = TelemetrySnapshot(
+        timestamp=1.0,
+        quaternion_w=1.0,
+        quaternion_x=0.0,
+        quaternion_y=0.0,
+        quaternion_z=0.0,
+        quaternion_timestamp_us=1_000_000,
+        quaternion_received_at=1.0,
+        north_m=float("nan"),
+        east_m=0.0,
+        down_m=0.0,
+        position_timestamp_us=cast(int, "invalid"),
+    )
+    assert snapshot.is_valid()
+    assert snapshot.quaternion_w == 1.0
+    assert snapshot.north_m is None
+    assert snapshot.position_timestamp_us is None
 
 
 def true_camera_matrix() -> np.ndarray:
@@ -187,7 +280,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
     但 ``frames[k]`` 配的是另一行的时刻——实测造成 0.2s 错位，Δt 与手眼外参
     全建立在错配上，产出一份看起来正常的错误 ``camera_calib.json``。
     """
-    from airdrop_calibration.calibrate import load_flight_frames_paired, load_flight_index
+    from airdrop_calibration.flight_log import load_flight_frames_paired, load_flight_index
 
     flight = workdir / "flight"
     (flight / "frames").mkdir(parents=True)
@@ -245,7 +338,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
 
 def test_flight_index_time_bases_and_missing_received(workdir: Path) -> None:
     """帧索引的两条时间轴：默认给 received（标定用），capture 只做诊断；缺字段显式报错。"""
-    from airdrop_calibration.calibrate import load_flight_index, load_flight_stamps
+    from airdrop_calibration.flight_log import load_flight_index, load_flight_stamps
 
     flight = workdir / "flight"
     flight.mkdir()
@@ -316,7 +409,6 @@ def test_lag_measurement_is_absolute_on_received_axis() -> None:
 
     本用例直接喂受控序列（不渲染）：同一批姿态，只改录制时的 lag，看两条轴分别怎么变。
     """
-    from airdrop_calibration.calibrate import measure_frame_telemetry_lag
 
     count = 30
     frame_dt = 1.0 / 30.0
@@ -517,7 +609,12 @@ def _motion_pairs(
     return a_list, b_list
 
 
-def _board_views(count: int = 24, distance: float = 0.55):
+def _board_views(
+    count: int = 24,
+    distance: float = 0.55,
+    *,
+    pattern_size: tuple[int, int] = PATTERN,
+):
     """渲染一批"相机对着板子"的视图，返回 (帧, 棋盘格→相机 位姿)。"""
     frames: list[np.ndarray] = []
     poses: list[np.ndarray] = []
@@ -528,7 +625,7 @@ def _board_views(count: int = 24, distance: float = 0.55):
             tilt_deg=16.0 * math.sin(index * 0.9),
             yaw_deg=13.0 * math.cos(index * 0.6),
             rim_roll_deg=10.0 * math.sin(index * 1.7),
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         frames.append(
@@ -538,7 +635,7 @@ def _board_views(count: int = 24, distance: float = 0.55):
                 true_camera_matrix(),
                 TRUE_DIST,
                 TRUE_SIZE,
-                pattern_size=PATTERN,
+                pattern_size=pattern_size,
                 square_size=SQUARE,
             )
         )
@@ -619,300 +716,7 @@ def test_extrinsics_rejects_single_rotation_axis() -> None:
         (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(cameras)
     ]
     with pytest.raises(ValueError, match="旋转轴过于单一"):
-        run_extrinsics(board_poses=board_poses, body_poses=bodies)
-
-
-def _bodies_with_real_translation(seed: int, count: int = 14) -> list[np.ndarray]:
-    """一批位置真的在动的遥测位姿（室内无 GPS 时取不到的就是这个）。"""
-    rng = np.random.default_rng(seed)
-    bodies = []
-    for rotation in _random_rotations(count, seed):
-        matrix = np.eye(4)
-        matrix[:3, :3] = rotation
-        matrix[:3, 3] = rng.normal(scale=0.3, size=3)
-        bodies.append(matrix)
-    return bodies
-
-
-def _board_poses_from_cameras(
-    cameras: Sequence[np.ndarray],
-) -> list[tuple[float, np.ndarray, np.ndarray]]:
-    """PnP 位姿 → ``run_extrinsics`` 要的 ``(时刻, rvec, tvec)``。"""
-    return [
-        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(cameras)
-    ]
-
-
-def test_extrinsics_estimates_lever_arm_from_real_telemetry_positions() -> None:
-    """遥测位置可信时杆臂估计值应当回到真值——这正是它拿来和尺量值比对的意义。"""
-    x_true = true_x_matrix()
-    bodies = _bodies_with_real_translation(5)
-    cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
-    result = run_extrinsics(
-        board_poses=_board_poses_from_cameras(cameras),
-        body_poses=bodies,
-    )
-    assert result.t_bc is not None
-    assert np.allclose(result.t_bc, TRUE_T_BC, atol=1e-9), np.abs(result.t_bc - TRUE_T_BC).max()
-    assert result.t_bc_reliable
-    assert result.residual_translation_m < 1e-9
-
-
-def test_extrinsics_flags_lever_arm_estimate_from_fake_telemetry_positions() -> None:
-    """无 GPS 时遥测位置恒零：旋转照样解得对，杆臂却估不准，必须被标为不可信。
-
-    照抄真实采集的失效模式：PnP 看到的相机位移是真的、遥测报的机体位置是假的，
-    于是平移方程 ``(R_a−I)t_x = R_x t_b − t_a`` 本身不自洽。判据必须落在残差上——
-    ``t_a`` 是真是假都解得出一个 ``t_x``，光看数字大小分辨不出来。
-    """
-    x_true = true_x_matrix()
-    bodies = _bodies_with_real_translation(3)
-    cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
-    lying = []
-    for pose in bodies:
-        copy = pose.copy()
-        copy[:3, 3] = 0.0  # 位置恒零（室内无 GPS 的典型表现）
-        lying.append(copy)
-
-    result = run_extrinsics(
-        board_poses=_board_poses_from_cameras(cameras),
-        body_poses=lying,
-    )
-    # 1) 旋转不受影响：A 的旋转块与位置无关，解照样精确（1e-3 度是纯数值噪声量级）
-    assert rotation_angle_deg(result.r_bc.T @ true_r_bc()) < 1e-3
-    # 2) 平移估计偏了好几厘米，残差远超门限
-    assert result.t_bc is not None
-    assert np.linalg.norm(result.t_bc - TRUE_T_BC) > 0.05, result.t_bc
-    assert result.residual_translation_m > 0.5
-    assert not result.t_bc_reliable
-    # 3) 诊断量直接说明原因：遥测说机体没动，画面说相机动了米级
-    assert result.body_span_m == 0.0
-    assert result.camera_span_m > 1.0
-    assert not result.body_span_ok
-
-
-def _bodies_with_tiny_translation(
-    seed: int, count: int = 12, scale: float = 1e-3
-) -> list[np.ndarray]:
-    """姿态照常多样，但位置缩到毫米级的遥测位姿（"位置几乎不动"）。"""
-    rng = np.random.default_rng(seed)
-    bodies = []
-    for rotation in _random_rotations(count, seed):
-        matrix = np.eye(4)
-        matrix[:3, :3] = rotation
-        matrix[:3, 3] = rng.normal(scale=scale, size=3)
-        bodies.append(matrix)
-    return bodies
-
-
-def test_extrinsics_flags_lever_arm_when_telemetry_barely_moves() -> None:
-    """遥测位置只动毫米级时判为不可信——**残差是干净的，量纲才看得出来**。
-
-    位置缩到毫米级时残差小到 1e-16，估计值甚至仍然精确（合成数据本身自洽，无噪声）；
-    但真实采集里"无 GPS ⇒ 位置恒零/几乎不动"意味着遥测位置对杆臂**完全没有约束力**，
-    而且它的错误可以被方程整体吸收（见
-    ``test_extrinsics_flags_zeroed_telemetry_even_though_residual_is_clean``）。
-    所以判据除了残差，还必须在量纲上设一道门槛（:func:`telemetry_span_ok`）。
-    """
-    x_true = true_x_matrix()
-    bodies = _bodies_with_tiny_translation(11)
-    cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
-    result = run_extrinsics(board_poses=_board_poses_from_cameras(cameras), body_poses=bodies)
-
-    assert result.residual_translation_m < 1e-9, result.residual_translation_m
-    assert result.body_span_m < 0.01, result.body_span_m
-    assert not result.body_span_ok
-    assert not result.t_bc_reliable
-
-
-def test_extrinsics_flags_zeroed_telemetry_even_though_residual_is_clean() -> None:
-    """遥测位置整体置零：残差**一位不变**，估计值却偏 0.664 m。
-
-    几何取"板子固定、相机原地转"（``look_at_board`` 的默认行为，也是项目端到端合成标定
-    飞行用的几何）：它满足 ``p_k = c + R_k v``，于是置零带来的右端扰动 ``Δt_a = (R_a−I)v``
-    整体落在 ``A = stack(R_a − I)`` 的**列空间**里，最小二乘把它完全吸收进 ``t_x``——
-    残差逐位不变（实测差 2e-17 m），解偏 ``|v|``（实测 0.6639 m，而真值杆臂只有 0.112 m）。
-    这就是"光看残差抓不住假 t_a"的反例，也是 :func:`telemetry_span_ok` 存在的理由。
-    """
-    x_true = true_x_matrix()
-    _frames, poses = _board_views(12)
-    bodies = [body_pose_from_board(p, x_true) for p in poses]
-    board_poses = [
-        (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(poses)
-    ]
-    lying = []
-    for pose in bodies:
-        copy = pose.copy()
-        copy[:3, 3] = 0.0
-        lying.append(copy)
-
-    real = run_extrinsics(board_poses=board_poses, body_poses=bodies)
-    zeroed = run_extrinsics(board_poses=board_poses, body_poses=lying)
-
-    # 1) 两组残差几乎一模一样——残差判据分辨不出来
-    assert zeroed.residual_translation_m < 1e-9
-    assert abs(zeroed.residual_translation_m - real.residual_translation_m) < 1e-12
-    # 2) 但置零那组的杆臂估计偏了半个量级（|v| = 0.664 m）
-    assert zeroed.t_bc is not None
-    assert np.linalg.norm(zeroed.t_bc - TRUE_T_BC) > 0.5, zeroed.t_bc
-    # 3) 跨度判据把它拦下，真实位置那组放行（该几何画面跨度=0 时另当别论，见 telemetry_span_ok）
-    assert zeroed.body_span_m == 0.0
-    assert not zeroed.body_span_ok
-    assert not zeroed.t_bc_reliable
-
-
-def _noisy_cameras(
-    cameras: Sequence[np.ndarray],
-    seed: int,
-    *,
-    rotation_deg: float = 0.05,
-    translation_m: float = 2e-3,
-) -> list[np.ndarray]:
-    """给 PnP 位姿加确定性小扰动（模拟检测误差）。
-
-    ⚠ 无噪声数据下"堆叠最小二乘"与"逐行相加"都给真值、**分辨不出差别**；要钉住"用的
-    是哪一种"，必须让数据带一点噪声。
-    """
-    rng = np.random.default_rng(seed)
-    out = []
-    for pose in cameras:
-        axis = rng.normal(size=3)
-        axis = axis / float(np.linalg.norm(axis)) * math.radians(rotation_deg)
-        matrix = pose.copy()
-        matrix[:3, :3] = pose[:3, :3] @ _axis_angle_to_matrix(axis)
-        matrix[:3, 3] = pose[:3, 3] + rng.normal(scale=translation_m, size=3)
-        out.append(matrix)
-    return out
-
-
-def test_translation_branch_is_stacked_least_squares() -> None:
-    """杆臂估计必须是**堆叠最小二乘**，不是"逐行相加再解 3×3"。
-
-    两者不等价：逐行相加 ≈ 给每对**等权**，而旋转角小的对几乎不提供信息、却把噪声全额
-    带进平均。对拍实测（docs/calibration_opencv.md）：同一批数据上逐行相加的杆臂误差中位
-    大 1.4–3.5 倍；而"堆叠最小二乘"与 cv2 官方 ``calibrateHandEye`` 的 PARK 方法在**同一个
-    旋转解**下逐位相同（差 3.4e-16 m）。本用例把"用的是哪一种"钉死。
-    """
-    x_true = true_x_matrix()
-    bodies = _bodies_with_real_translation(9)
-    cameras = _noisy_cameras([np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies], seed=1)
-    # min_pair_rotation_deg=0 ⇒ 生产代码与下面手算的解用**同一批运动对**
-    result = run_extrinsics(
-        board_poses=_board_poses_from_cameras(cameras),
-        body_poses=bodies,
-        min_pair_rotation_deg=0.0,
-    )
-    a_list, b_list = _motion_pairs(bodies, cameras)
-    rotation = result.r_bc
-    assert result.t_bc is not None
-
-    rows = np.vstack([a[:3, :3] - np.eye(3) for a in a_list])
-    rhs = np.concatenate(
-        [rotation @ b[:3, 3] - a[:3, 3] for a, b in zip(a_list, b_list, strict=True)]
-    )
-    stacked, *_ = np.linalg.lstsq(rows, rhs, rcond=None)
-    assert np.allclose(result.t_bc, stacked, atol=1e-9), np.abs(result.t_bc - stacked).max()
-
-    summed_matrix = np.sum([a[:3, :3] - np.eye(3) for a in a_list], axis=0)
-    summed_vector = np.sum(
-        [rotation @ b[:3, 3] - a[:3, 3] for a, b in zip(a_list, b_list, strict=True)],
-        axis=0,
-    )
-    summed, *_ = np.linalg.lstsq(summed_matrix, summed_vector, rcond=None)
-    assert np.linalg.norm(result.t_bc - summed) > 1e-4, "两种写法在这批数据上应当可区分"
-    # 顺便钉住"为什么值得换"：堆叠解的误差不比逐行相加差（实测这批数据上还更小）
-    assert np.linalg.norm(stacked - TRUE_T_BC) <= np.linalg.norm(summed - TRUE_T_BC)
-
-
-def test_telemetry_span_ok_thresholds() -> None:
-    """跨度判据的两条量纲要求：机体得真的动过，且与画面跨度同量级。"""
-    assert telemetry_span_ok(0.45, 0.15)  # 同量级（真实采集）
-    assert not telemetry_span_ok(0.0, 0.15)  # 位置恒零（无 GPS 的典型表现）
-    assert not telemetry_span_ok(0.005, 0.15)  # 只动 5 mm，低于下限
-    assert not telemetry_span_ok(0.01, 0.5)  # 比值 0.02：两边差一个数量级
-    assert not telemetry_span_ok(5.0, 0.15)  # 反方向也查（比值 33）
-    assert not telemetry_span_ok(float("nan"), 0.15)
-    assert not telemetry_span_ok(0.1, 0.0)  # 画面跨度为 0：无从比较
-
-
-def test_extrinsics_accepts_ndarray_body_poses() -> None:
-    """``body_poses`` 传逐帧堆叠的 ndarray 也要能跑。
-
-    ``_translation_span`` 的空值判断曾是 ``if not poses``，对 ndarray 是"多元素真值判断"
-    歧义，会抛 ``ValueError: The truth value of an array ... is ambiguous``。
-    """
-    x_true = true_x_matrix()
-    bodies = _bodies_with_real_translation(5)
-    cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
-    result = run_extrinsics(
-        board_poses=_board_poses_from_cameras(cameras),
-        body_poses=np.stack(bodies),
-    )
-    assert result.t_bc is not None
-    assert np.allclose(result.t_bc, TRUE_T_BC, atol=1e-9), np.abs(result.t_bc - TRUE_T_BC).max()
-
-
-def test_extrinsics_can_skip_lever_arm_estimate() -> None:
-    """``estimate_body_translation=False`` 时不算平移；此时不能把 None 当成"可信"。"""
-    x_true = true_x_matrix()
-    bodies = _bodies_with_real_translation(5)
-    cameras = [np.linalg.inv(x_true) @ np.linalg.inv(g) for g in bodies]
-    result = run_extrinsics(
-        board_poses=_board_poses_from_cameras(cameras),
-        body_poses=bodies,
-        estimate_body_translation=False,
-    )
-    assert result.t_bc is None
-    assert not result.t_bc_reliable
-    assert result.r_bc is not None
-
-
-def test_lever_arm_report_pairs_estimate_with_measured_value() -> None:
-    """报告里尺量值是 authoritative，估计值只用于比对（逐轴差 + 欧氏距离）。"""
-    result = ExtrinsicsResult(
-        r_bc=true_r_bc(),
-        t_bc=np.array([0.07, -0.02, 0.08]),
-        pairs=12,
-        residual_rotation_deg=0.1,
-        t_bc_reliable=True,
-        residual_translation_m=0.003,
-        body_span_m=1.2,
-        camera_span_m=1.3,
-        body_span_ok=True,
-    )
-    report = lever_arm_report(result, (0.06, -0.03, 0.09))
-    assert report["authoritative"] == [0.06, -0.03, 0.09]
-    assert report["source"] == "measured"
-    assert report["estimated"] == pytest.approx([0.07, -0.02, 0.08])
-    assert report["delta_xyz_m"] == pytest.approx([0.01, 0.01, -0.01])
-    assert report["delta_m"] == pytest.approx(math.sqrt(3e-4))
-    assert report["estimated_reliable"] is True
-    assert report["residual_tolerance_m"] == pytest.approx(lever_arm_tolerance(1.3))
-    # 跨度诊断量也要进报告：光看残差抓不住"遥测位置没动"（见 telemetry_span_ok 的 docstring）
-    assert report["body_span_ok"] is True
-    assert report["span_ratio"] == pytest.approx(1.2 / 1.3)
-
-
-def test_lever_arm_report_keeps_measured_value_without_estimate() -> None:
-    """解不出外参或没估平移时，报告仍要给尺量值，估计值一律 None（不是 0）。"""
-    empty = lever_arm_report(None)
-    assert empty["authoritative"] == list(MEASURED_T_BC)
-    assert empty["estimated"] is None
-    assert empty["delta_m"] is None
-    assert empty["estimated_reliable"] is False
-    assert empty["body_span_ok"] is False
-    assert empty["span_ratio"] is None
-
-    skipped = ExtrinsicsResult(r_bc=true_r_bc(), t_bc=None, pairs=9, residual_rotation_deg=0.2)
-    assert lever_arm_report(skipped)["estimated"] is None
-
-
-def test_lever_arm_report_default_tracks_facade_constant(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """兼容入口在运行时覆盖尺量常量后，报告默认值同步更新。"""
-    monkeypatch.setattr(calibrate_module, "MEASURED_T_BC", (0.1, 0.2, 0.3))
-    assert lever_arm_report(None)["authoritative"] == [0.1, 0.2, 0.3]
+        run_extrinsics(board_poses=board_poses, body_poses=[pose[:3, :3] for pose in bodies])
 
 
 def test_extrinsics_requires_one_body_pose_per_board_pose() -> None:
@@ -924,7 +728,7 @@ def test_extrinsics_requires_one_body_pose_per_board_pose() -> None:
         (float(index), cv2.Rodrigues(p[:3, :3])[0], p[:3, 3]) for index, p in enumerate(poses)
     ]
     with pytest.raises(ValueError, match="数量不一致"):
-        run_extrinsics(board_poses=board_poses, body_poses=bodies[:3])
+        run_extrinsics(board_poses=board_poses, body_poses=[pose[:3, :3] for pose in bodies[:3]])
 
 
 # ----------------------------------------------------------------------
@@ -993,7 +797,8 @@ def test_rendered_board_matches_requested_pose() -> None:
     但位姿差 180°，手眼标定直接报废，靠重投影根本发现不了。只有方格相位能发现
     （实测错格时相符率 < 0.5，正确时 1.000）。
     """
-    board = board_object_points(PATTERN, SQUARE)
+    pattern_size = ORIENTABLE_PATTERN
+    board = board_object_points(pattern_size, SQUARE)
     for index in (0, 3, 7, 11):
         rvec, tvec = look_at_board(
             0.55,
@@ -1001,7 +806,7 @@ def test_rendered_board_matches_requested_pose() -> None:
             tilt_deg=16.0 * math.sin(index * 0.9),
             yaw_deg=13.0 * math.cos(index * 0.6),
             rim_roll_deg=10.0 * math.sin(index * 1.7),
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         frame = render_board(
@@ -1010,7 +815,7 @@ def test_rendered_board_matches_requested_pose() -> None:
             true_camera_matrix(),
             TRUE_DIST,
             TRUE_SIZE,
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         ratio = pattern_phase_ok(
@@ -1019,7 +824,7 @@ def test_rendered_board_matches_requested_pose() -> None:
             tvec,
             true_camera_matrix(),
             TRUE_DIST,
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         assert ratio > 0.9, f"第 {index} 帧相位相符率只有 {ratio:.2f}：棋盘格与对象点错格了"
@@ -1029,11 +834,11 @@ def test_rendered_board_matches_requested_pose() -> None:
             board,
             true_camera_matrix(),
             TRUE_DIST,
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )[0]
         assert pose is not None, f"第 {index} 帧应当能解出位姿"
-        corners = detect_corners(frame, PATTERN)
+        corners = detect_corners(frame, pattern_size)
         assert corners is not None
         projected, _ = cv2.projectPoints(board, pose[0], pose[1], true_camera_matrix(), TRUE_DIST)
         # cv2 的类型桩把 projectPoints 的结果标成可能为 None，运行时它总是 ndarray；
@@ -1044,18 +849,14 @@ def test_rendered_board_matches_requested_pose() -> None:
         assert rms < 0.5, f"第 {index} 帧解出的位姿重投影残差 {rms:.3f} px"
 
 
-def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
-    """记录一条边界：相位分不出正序/反序标签——两支的相位相符率都是 1.000。
-
-    棋盘格绕板面法向转 180° 后图像一模一样，单帧图像里没有信息能定下"哪个角点是 0 号"。
-    这正是 :func:`solve_board_poses` 必须靠相邻帧连续性定支的原因。
-    """
-    frames, camera_poses = _board_views(8)
+def test_pattern_phase_selects_direction_for_opposite_parity_board() -> None:
+    """异奇偶内角点棋盘的相位应区分正序和反序候选。"""
+    frames, camera_poses = _board_views(8, pattern_size=ORIENTABLE_PATTERN)
     frame = frames[3]
     rvec = cv2.Rodrigues(camera_poses[3][:3, :3])[0]
     tvec = camera_poses[3][:3, 3]
-    board = board_object_points(PATTERN, SQUARE)
-    corners = detect_corners(frame, PATTERN)
+    board = board_object_points(ORIENTABLE_PATTERN, SQUARE)
+    corners = detect_corners(frame, ORIENTABLE_PATTERN)
     assert corners is not None
     good = pattern_phase_ok(
         frame,
@@ -1063,7 +864,7 @@ def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
         tvec,
         true_camera_matrix(),
         TRUE_DIST,
-        pattern_size=PATTERN,
+        pattern_size=ORIENTABLE_PATTERN,
         square_size=SQUARE,
     )
     # 另一个标签支：把检测到的角点顺序整体反过来的那个解
@@ -1086,11 +887,117 @@ def test_pattern_phase_is_blind_to_label_ambiguity() -> None:
         other_tvec,
         true_camera_matrix(),
         TRUE_DIST,
-        pattern_size=PATTERN,
+        pattern_size=ORIENTABLE_PATTERN,
         square_size=SQUARE,
     )
     assert good > 0.9, f"正确位姿的相位相符率只有 {good:.2f}"
-    assert flipped > 0.9, f"另一支的相位本该也是 1.0，实际 {flipped:.2f}"
+    assert flipped < 0.1, f"反序候选不应通过相位门槛，实际 {flipped:.2f}"
+    selected = solve_board_poses(
+        [frame],
+        board,
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=ORIENTABLE_PATTERN,
+        square_size=SQUARE,
+    )[0]
+    assert selected is not None
+    assert rotation_angle_deg(cv2.Rodrigues(selected[0])[0].T @ cv2.Rodrigues(rvec)[0]) < 2.0
+
+
+@pytest.mark.parametrize("turn_deg", [120.0, 180.0])
+def test_pattern_phase_tracks_large_real_turn_without_continuity_guess(turn_deg: float) -> None:
+    """连续帧转过大角度时仍按各帧棋盘相位独立判向。"""
+    pattern = ORIENTABLE_PATTERN
+    base_rvec, base_tvec = look_at_board(
+        0.55, true_camera_matrix(), pattern_size=pattern, square_size=SQUARE
+    )
+    base_rotation = cv2.Rodrigues(base_rvec)[0]
+    center = np.array([(pattern[0] * SQUARE) / 2, (pattern[1] * SQUARE) / 2, 0.0])
+    images: list[np.ndarray] = []
+    expected: list[np.ndarray] = []
+    for angle in (0.0, turn_deg):
+        rotation = base_rotation @ rotation_z(angle)
+        tvec = (base_tvec.reshape(3) + base_rotation @ center - rotation @ center).reshape(3, 1)
+        rvec = cv2.Rodrigues(rotation)[0]
+        images.append(
+            render_board(
+                rvec,
+                tvec,
+                true_camera_matrix(),
+                TRUE_DIST,
+                TRUE_SIZE,
+                pattern_size=pattern,
+                square_size=SQUARE,
+            )
+        )
+        expected.append(rotation)
+    poses = solve_board_poses(
+        images,
+        board_object_points(pattern, SQUARE),
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=pattern,
+        square_size=SQUARE,
+    )
+    assert all(pose is not None for pose in poses)
+    for pose, truth in zip(poses, expected, strict=True):
+        assert pose is not None
+        solved_rotation = cv2.Rodrigues(pose[0])[0]
+        assert rotation_angle_deg(solved_rotation.T @ truth) < 4.0
+
+
+@pytest.mark.parametrize("pattern", [(9, 6), (8, 5)])
+def test_solve_board_poses_accepts_opposite_parity_dimensions(pattern: tuple[int, int]) -> None:
+    """两种异奇偶方向都应返回通过黑白相位判定的位姿。"""
+    frame = render_board(
+        np.array([[0.2], [-0.3], [0.1]]),
+        np.array([[0.0], [0.0], [0.7]]),
+        true_camera_matrix(),
+        TRUE_DIST,
+        TRUE_SIZE,
+        pattern_size=pattern,
+        square_size=SQUARE,
+    )
+    points = board_object_points(pattern, SQUARE)
+    pose = solve_board_poses(
+        [frame],
+        points,
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=pattern,
+        square_size=SQUARE,
+    )[0]
+    assert pose is not None
+
+
+def test_solve_board_poses_rejects_same_parity_and_low_contrast() -> None:
+    """不可辨方向的奇偶尺寸报错，低对比度图像不产生伪位姿。"""
+    with pytest.raises(ValueError, match="必须一奇一偶"):
+        solve_board_poses(
+            [],
+            board_object_points((8, 6), SQUARE),
+            true_camera_matrix(),
+            TRUE_DIST,
+            pattern_size=(8, 6),
+        )
+    frame = render_board(
+        np.array([[0.2], [-0.3], [0.1]]),
+        np.array([[0.0], [0.0], [0.7]]),
+        true_camera_matrix(),
+        TRUE_DIST,
+        TRUE_SIZE,
+        pattern_size=ORIENTABLE_PATTERN,
+        square_size=SQUARE,
+    )
+    low_contrast = np.clip(128 + (frame.astype(np.float32) - 128) * 0.1, 0, 255).astype(np.uint8)
+    assert solve_board_poses(
+        [low_contrast],
+        board_object_points(ORIENTABLE_PATTERN, SQUARE),
+        true_camera_matrix(),
+        TRUE_DIST,
+        pattern_size=ORIENTABLE_PATTERN,
+        square_size=SQUARE,
+    ) == [None]
 
 
 # ----------------------------------------------------------------------
@@ -1103,10 +1010,12 @@ def test_full_pipeline_recovers_extrinsics_from_synthetic_views() -> None:
     机体位姿（模拟"板子固定、飞机在动"的采集）→ ``AX=XB`` 解 ``X``。
     """
     x_true = true_x_matrix()
-    board = board_object_points(PATTERN, SQUARE)
-    frames, camera_poses = _board_views(24)
+    board = board_object_points(ORIENTABLE_PATTERN, SQUARE)
+    frames, camera_poses = _board_views(24, pattern_size=ORIENTABLE_PATTERN)
 
-    intrinsics = run_intrinsics(frames, pattern_size=PATTERN, square_size=SQUARE, min_views=8)
+    intrinsics = run_intrinsics(
+        frames, pattern_size=ORIENTABLE_PATTERN, square_size=SQUARE, min_views=8
+    )
     assert intrinsics.rms < 1.0
     assert intrinsics.camera_matrix[0, 0] == pytest.approx(TRUE_FX, rel=0.02)
 
@@ -1115,7 +1024,7 @@ def test_full_pipeline_recovers_extrinsics_from_synthetic_views() -> None:
         board,
         intrinsics.camera_matrix,
         intrinsics.dist_coeffs,
-        pattern_size=PATTERN,
+        pattern_size=ORIENTABLE_PATTERN,
         square_size=SQUARE,
     )
     solved: list[tuple[float, np.ndarray, np.ndarray]] = []
@@ -1134,17 +1043,12 @@ def test_full_pipeline_recovers_extrinsics_from_synthetic_views() -> None:
     assert len(branches) == 1, "标签支必须全程一致——混用会让 AX=XB 崩掉"
 
     bodies = [body_pose_from_board(p, x_true) for p in camera_poses]
-    extrinsics = run_extrinsics(board_poses=solved, body_poses=bodies)
+    extrinsics = run_extrinsics(board_poses=solved, body_poses=[pose[:3, :3] for pose in bodies])
     assert extrinsics.ok
     error = rotation_angle_deg(extrinsics.r_bc.T @ true_r_bc())
     assert error < 3.0, f"外参旋转误差 {error:.3f}° 过大"
     assert extrinsics.axis_spread_deg > 15.0
     assert extrinsics.pairs >= 10
-    # 杆臂估计值现在也解出来（进标定文件的仍是尺量值，见 lever_arm_report）：
-    # 合成链路里 A 由 P 导出、遥测位置天然"可信"，所以估计值应当接近真值（实测差 ~7mm）
-    assert extrinsics.t_bc is not None
-    assert np.allclose(extrinsics.t_bc, TRUE_T_BC, atol=0.03), extrinsics.t_bc
-    assert extrinsics.t_bc_reliable
 
 
 def test_full_pipeline_rejects_insufficient_rotation_excitation() -> None:
@@ -1164,7 +1068,7 @@ def test_full_pipeline_rejects_insufficient_rotation_excitation() -> None:
         for index, p in enumerate(camera_poses)
     ]
     with pytest.raises(ValueError, match="旋转激励不够"):
-        run_extrinsics(board_poses=board_poses, body_poses=bodies)
+        run_extrinsics(board_poses=board_poses, body_poses=[pose[:3, :3] for pose in bodies])
 
 
 # ----------------------------------------------------------------------
@@ -1189,6 +1093,8 @@ def _write_calibration_flight(
     video_delay_s: float = 0.15,
     lag_cfg_s: float = 0.15,
     telemetry_delay_s: float = 0.0,
+    pattern_size: tuple[int, int] = PATTERN,
+    position_available: bool = True,
 ) -> None:
     """手写一个可标定的飞行目录（渲染棋盘格帧 + 与之自洽的遥测）。
 
@@ -1223,7 +1129,7 @@ def _write_calibration_flight(
             tilt_deg=15.0 * math.sin(index * 0.9),
             yaw_deg=12.0 * math.cos(index * 0.6),
             rim_roll_deg=10.0 * math.sin(index * 1.7),
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         image = render_board(
@@ -1232,7 +1138,7 @@ def _write_calibration_flight(
             true_camera_matrix(),
             TRUE_DIST,
             TRUE_SIZE,
-            pattern_size=PATTERN,
+            pattern_size=pattern_size,
             square_size=SQUARE,
         )
         name = f"{index:06d}.jpg"
@@ -1287,11 +1193,15 @@ def _write_calibration_flight(
                         timestamp=stamp,
                         quaternion_received_at=stamp,
                         quaternion_timestamp_us=round((stamp - t0 - telemetry_delay_s + 1) * 1e6),
-                        position_velocity_received_at=stamp,
-                        position_timestamp_us=round((stamp - t0 - telemetry_delay_s + 1) * 1e6),
-                        north_m=float(pose[0, 3]),
-                        east_m=float(pose[1, 3]),
-                        down_m=float(pose[2, 3]),
+                        position_velocity_received_at=(stamp if position_available else None),
+                        position_timestamp_us=(
+                            round((stamp - t0 - telemetry_delay_s + 1) * 1e6)
+                            if position_available
+                            else None
+                        ),
+                        north_m=float(pose[0, 3]) if position_available else None,
+                        east_m=float(pose[1, 3]) if position_available else None,
+                        down_m=float(pose[2, 3]) if position_available else None,
                         quaternion_w=w,
                         quaternion_x=x,
                         quaternion_y=y,
@@ -1306,40 +1216,33 @@ def _write_calibration_flight(
 def test_calibrate_payload_records_lever_arm_against_measured_value(
     workdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """输出契约：``t_bc`` 恒为尺量值，标定估计值进 ``meta`` 供对比校验。
-
-    这条同时盯住"改了文件顶部的 ``MEASURED_T_BC``，输出必须跟着变"——该常量曾是
-    ``lever_arm_report`` 的默认参数（定义时绑定），那样改常量不会生效。
+    """输出契约：``t_bc`` 恒为尺量值，平移估计进 ``meta`` 供对比。
     顺带钉住时间差的语义：素材里注入的是"视频延时 0.15 / 配置 lag 0.15 / 遥测延时 0"，
     所以标出来的必须是 **received 轴**的绝对量 ≈0.15（拿 capture 轴测会得到 ≈0.0）。
     """
     flight_dir = workdir / "flight"
     flight_dir.mkdir()
-    _write_calibration_flight(flight_dir)
     measured = (0.05, -0.04, 0.08)
     monkeypatch.setattr(calibrate_module, "MEASURED_T_BC", measured)
 
-    # 合成板子是 (7,5)/30mm，而 calibrate() 的默认值是实拍用的 (9,6)/25mm——显式传入
-    payload = calibrate(flight_dir, pattern_size=PATTERN, square_size=SQUARE)
+    # 合成标定流程使用可由方格相位定向的棋盘尺寸。
+    _write_calibration_flight(flight_dir, pattern_size=ORIENTABLE_PATTERN, position_available=False)
+    payload = calibrate(flight_dir, pattern_size=ORIENTABLE_PATTERN, square_size=SQUARE)
 
     # 1) 标定文件里的 t_bc 恒为尺量值（georef 读的就是这个字段）
     assert payload["t_bc"] == list(measured)
     assert payload["meta"]["extrinsics"]["t_bc_source"] == "measured"
-    arm = payload["meta"]["extrinsics"]["lever_arm"]
-    assert arm["authoritative"] == list(measured)
-    assert arm["source"] == "measured"
-    assert arm["estimated"] is not None
-    # 2) 估计值与尺量值的差：逐轴差值 + 欧氏距离，两者必须自洽
-    delta = np.asarray(arm["delta_xyz_m"])
-    assert np.allclose(delta, np.asarray(arm["estimated"]) - np.asarray(measured))
-    assert arm["delta_m"] == pytest.approx(float(np.linalg.norm(delta)))
-    # 3) 合成链路里遥测位置是真的：估计值接近真值（也就接近尺量值）且被判为可信
-    assert np.allclose(arm["estimated"], TRUE_T_BC, atol=0.03), arm["estimated"]
-    assert arm["estimated_reliable"] is True
-    assert arm["residual_translation_m"] < arm["residual_tolerance_m"]
-    # 4) 旋转仍以手眼标定为准
+    arm = payload["meta"]["translation_diagnostic"]
+    assert arm["measured"] == list(measured)
+    assert payload["meta"]["extrinsics"]["mode"] == "rotation_only"
+    assert arm["estimated"] is None
+    # 2) 缺位置时只跳过独立对表，不改变旋转与延迟主结果。
+    assert arm["status"] == "skipped"
+    assert arm["estimated"] is None
+    assert arm["reason"]
+    # 3) 旋转仍以手眼标定为准
     assert rotation_angle_deg(np.asarray(payload["R_bc"]).T @ true_r_bc()) < 5.0
-    # 5) 时间差：received 轴给出**绝对对齐量** = 视频延时 − 遥测延时 = 0.15 − 0 = 0.15
+    # 4) 时间差：received 轴给出**绝对对齐量** = 视频延时 − 遥测延时 = 0.15 − 0 = 0.15
     assert payload["telemetry_lag"] == pytest.approx(0.15, abs=0.02)
     time_offset = payload["meta"]["time_offset"]
     assert time_offset["time_base"] == "received"
@@ -1347,3 +1250,108 @@ def test_calibrate_payload_records_lever_arm_against_measured_value(
     # capture 轴残差 = 绝对量 − 基准 ≈ 0（两条轴互核通过）
     assert time_offset["lag_residual_on_capture_axis_s"] == pytest.approx(0.0, abs=0.02)
     assert time_offset["cross_check_ok"] is True
+
+
+def test_translation_diagnostic_keeps_rotation_and_lag_independent(
+    workdir: Path,
+) -> None:
+    flight_dir = workdir / "translation-flight"
+    flight_dir.mkdir()
+    _write_calibration_flight(flight_dir, pattern_size=ORIENTABLE_PATTERN, position_available=True)
+    estimated = calibrate(flight_dir, pattern_size=ORIENTABLE_PATTERN, square_size=SQUARE)
+    disabled = calibrate(
+        flight_dir,
+        pattern_size=ORIENTABLE_PATTERN,
+        square_size=SQUARE,
+        estimate_translation=False,
+    )
+    telemetry_path = flight_dir / "telemetry.jsonl"
+    damaged = [json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()]
+    for row in damaged:
+        row["north_m"] = float("nan")
+    telemetry_path.write_text(
+        "\n".join(json.dumps(row) for row in damaged) + "\n", encoding="utf-8"
+    )
+    bad_position = calibrate(flight_dir, pattern_size=ORIENTABLE_PATTERN, square_size=SQUARE)
+    arm = estimated["meta"]["translation_diagnostic"]
+    assert arm["status"] == "estimated"
+    assert arm["estimated"] is not None
+    assert estimated["t_bc"] == disabled["t_bc"]
+    assert np.allclose(estimated["R_bc"], disabled["R_bc"], atol=1e-11)
+    assert estimated["telemetry_lag"] == pytest.approx(disabled["telemetry_lag"], abs=1e-11)
+    assert disabled["meta"]["translation_diagnostic"]["status"] == "disabled"
+    assert np.allclose(bad_position["R_bc"], estimated["R_bc"], atol=1e-11)
+    assert bad_position["telemetry_lag"] == pytest.approx(estimated["telemetry_lag"], abs=1e-11)
+    bad_arm = bad_position["meta"]["translation_diagnostic"]
+    assert bad_arm["status"] == "skipped"
+    assert bad_arm["estimated"] is None
+
+
+@pytest.mark.parametrize("frame_encode_errors", [None, 1])
+def test_full_capture_requires_zero_frame_encode_errors(
+    workdir: Path, frame_encode_errors: int | None
+) -> None:
+    from airdrop_calibration.calibrate import _validate_full_update_capture
+
+    flight_dir = workdir / "incomplete-capture"
+    flight_dir.mkdir()
+    (flight_dir / "config_snapshot.json").write_text(
+        json.dumps({"record": {"telemetry_hz": 0}}), encoding="utf-8"
+    )
+    stopped = {
+        "kind": "recorder_stopped",
+        "telemetry_received": 0,
+        "telemetry_enqueued": 0,
+        "telemetry_written": 0,
+        "telemetry_dropped": 0,
+        "telemetry_write_errors": 0,
+        "telemetry_pending": 0,
+        "finalize_errors": 0,
+        "frames_skipped": 0,
+        "events": 0,
+    }
+    if frame_encode_errors is not None:
+        stopped["frame_encode_errors"] = frame_encode_errors
+    (flight_dir / "events.jsonl").write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="遥测队列不完整"):
+        _validate_full_update_capture(flight_dir, [])
+
+
+def test_report_does_not_claim_extrinsics_when_hand_eye_failed() -> None:
+    from airdrop_calibration.models import IntrinsicsResult, LagMeasurement, LagResult
+    from airdrop_calibration.report import build_calibration_report
+
+    payload = build_calibration_report(
+        intrinsics=IntrinsicsResult(
+            camera_matrix=np.eye(3),
+            dist_coeffs=np.zeros(5),
+            image_size=(640, 480),
+            rms=0.2,
+            views=10,
+        ),
+        lag=LagResult(lag_s=0.1, peak=0.9, samples=30),
+        measurement=LagMeasurement(
+            absolute=LagResult(lag_s=0.1, peak=0.9, samples=30),
+            residual=None,
+            baseline_s=0.0,
+            cross_check_ok=True,
+        ),
+        extrinsics=None,
+        flight_dir=Path("flight"),
+        pattern_size=(8, 5),
+        square_size=0.03,
+        lag_search_s=0.5,
+        lag_step_s=0.01,
+        translation_diagnostic={
+            "status": "skipped",
+            "reason": "rotation_unavailable",
+            "measured": list(MEASURED_T_BC),
+            "estimated": None,
+            "delta_xyz_m": None,
+            "delta_m": None,
+            "residual_m": None,
+            "pairs": 0,
+        },
+    )
+    assert payload["R_bc"] is None
+    assert payload["meta"]["extrinsics"] is None
