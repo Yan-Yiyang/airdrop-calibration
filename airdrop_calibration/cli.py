@@ -81,7 +81,11 @@ SUBCOMMANDS = {
                 source="LAG_STEP_S",
             ),
             Option(
-                ("--max-frames",), "max_frames", "最多读取多少帧", kind="int", source="MAX_FRAMES"
+                ("--max-frames",),
+                "max_frames",
+                "调试时只分析索引前缀；默认完整采集",
+                kind="int",
+                source="MAX_FRAMES",
             ),
             Option(
                 ("--strict",),

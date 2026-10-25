@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -49,7 +50,12 @@ except SystemExit as exc:
 assert not any(n in sys.modules for n in ('cv2', 'torch', 'mavsdk', 'rapidocr', 'ultralytics'))
 """.replace("COMMAND", repr(command))
     result = subprocess.run(
-        [sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True, check=False
+        [sys.executable, "-X", "utf8", "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONUTF8": "1"},
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 

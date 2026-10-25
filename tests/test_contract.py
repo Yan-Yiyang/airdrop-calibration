@@ -77,7 +77,7 @@ def test_calibration_python_sources_have_no_airdrop_imports() -> None:
 
 def test_frame_reader_rejects_paths_outside_flight_directory(tmp_path: Path) -> None:
     """帧索引中的路径不能借 ../ 访问飞行目录之外的文件。"""
-    from airdrop_calibration.flight_log import load_flight_frames_paired
+    from airdrop_calibration.flight_log import iter_flight_frames_paired
 
     flight = tmp_path / "flight"
     flight.mkdir()
@@ -89,12 +89,12 @@ def test_frame_reader_rejects_paths_outside_flight_directory(tmp_path: Path) -> 
     }
     (flight / "frames_index.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="越过 frames 目录"):
-        load_flight_frames_paired(flight)
+        list(iter_flight_frames_paired(flight))
 
 
 def test_frame_reader_rejects_absolute_paths_even_inside_frames(tmp_path: Path) -> None:
     """相对路径契约在 Windows 盘符、UNC 与目录内绝对路径下都一致。"""
-    from airdrop_calibration.flight_log import load_flight_frames_paired
+    from airdrop_calibration.flight_log import iter_flight_frames_paired
 
     flight = tmp_path / "flight"
     frames = flight / "frames"
@@ -111,7 +111,7 @@ def test_frame_reader_rejects_absolute_paths_even_inside_frames(tmp_path: Path) 
         }
         (flight / "frames_index.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
         with pytest.raises(ValueError, match="相对路径"):
-            load_flight_frames_paired(flight)
+            list(iter_flight_frames_paired(flight))
 
 
 def test_frame_reader_rejects_nonfinite_timestamps(tmp_path: Path) -> None:

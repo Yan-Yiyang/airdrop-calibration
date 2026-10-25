@@ -7,8 +7,7 @@ OUTPUT_PATH = Path("camera_calib.json")
 PATTERN_SIZE = (9, 6)
 SQUARE_SIZE_M = 0.025
 MIN_VIEWS = 8
-MAX_VIEWS = 60
-MAX_FRAMES = 200
+MAX_FRAMES: int | None = None
 STRICT = False
 LAG_SEARCH_S = 0.5
 LAG_STEP_S = 0.005
@@ -29,7 +28,6 @@ __all__ = [
     "LAG_STEP_S",
     "MAX_FRAMES",
     "MAX_MOTION_PAIRS",
-    "MAX_VIEWS",
     "MEASURED_T_BC",
     "MIN_AXIS_SPREAD_DEG",
     "MIN_PAIR_ROTATION_DEG",

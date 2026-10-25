@@ -199,3 +199,14 @@ class ExtrinsicsResult:
     @property
     def ok(self) -> bool:
         return self.pairs >= 3 and math.isfinite(self.residual_rotation_deg)
+
+
+@dataclass(frozen=True, slots=True)
+class FrameObservation:
+    """标定阶段保留的紧凑角点观测，不包含图像像素。"""
+
+    stamp: FrameStamp
+    filename: str
+    corners: np.ndarray
+    image_size: tuple[int, int]
+    image_digest: bytes

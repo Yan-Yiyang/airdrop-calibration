@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -15,14 +16,15 @@ import numpy as np
 from .algorithms import (
     align_body_poses,
     board_object_points,
+    detect_corners,
     estimate_translation_fixed_rotation,
     measure_frame_telemetry_lag,
     run_extrinsics,
-    run_intrinsics,
-    solve_board_poses,
+    run_intrinsics_from_corners,
+    solve_board_pose,
 )
-from .flight_log import _frame_path, load_flight_frames_paired, load_flight_telemetry
-from .models import ExtrinsicsResult, LagMeasurement, LagResult, Telemetry
+from .flight_log import _frame_path, iter_flight_frames_paired, load_flight_telemetry
+from .models import ExtrinsicsResult, FrameObservation, LagMeasurement, LagResult, Telemetry
 from .report import CalibrationSource, build_calibration_report
 from .settings import (
     ESTIMATE_TRANSLATION,
@@ -89,41 +91,66 @@ def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
     square_size: float = SQUARE_SIZE_M,
     lag_search_s: float = LAG_SEARCH_S,
     lag_step_s: float = LAG_STEP_S,
-    max_frames: int = MAX_FRAMES,
+    max_frames: int | None = MAX_FRAMES,
     source: CalibrationSource = "measured_calibration",
     estimate_translation: bool = ESTIMATE_TRANSLATION,
 ) -> dict[str, Any]:
     """跑完三步，返回可写入 ``camera_calib.json`` 的字典。"""
     import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
 
+    if max_frames is not None and (isinstance(max_frames, bool) or max_frames < 1):
+        raise ValueError("max_frames 必须是正整数或 None")
     telemetry_rows = load_flight_telemetry(flight_dir)
     capture_quality = _validate_full_update_capture(flight_dir, telemetry_rows)
     LOGGER.info("读取标定素材: %s", flight_dir)
-    paired = load_flight_frames_paired(flight_dir, max_frames)
-    if not paired:
+    observations: list[FrameObservation] = []
+    frame_count = 0
+    first_received: float | None = None
+    last_received: float | None = None
+    image_size: tuple[int, int] | None = None
+    first_lag: float | None = None
+    min_lag = math.inf
+    max_lag = -math.inf
+    for stamp, filename, image in iter_flight_frames_paired(flight_dir, max_frames):
+        frame_count += 1
+        first_received = stamp.received_timestamp if first_received is None else first_received
+        last_received = stamp.received_timestamp
+        first_lag = stamp.lag_s if first_lag is None else first_lag
+        min_lag = min(min_lag, stamp.lag_s)
+        max_lag = max(max_lag, stamp.lag_s)
+        current_size = (int(image.shape[1]), int(image.shape[0]))
+        if image_size is None:
+            image_size = current_size
+        elif current_size != image_size:
+            raise ValueError(f"标定图像尺寸不一致: {image_size} 与 {current_size} ({filename})")
+        corners = detect_corners(image, pattern_size)
+        if corners is not None:
+            digest = hashlib.sha256(memoryview(image).cast("B")).digest()
+            observations.append(FrameObservation(stamp, filename, corners, current_size, digest))
+        del corners, image
+    if not frame_count:
         raise ValueError(f"{flight_dir} 里没有可用帧")
-    # 帧与时间记录来自同一条索引记录，**结构上不可能错位**。
-    # ⚠ 第 2/3 步一律用 received（原始"收到帧"时刻）：capture 是录制时按配置的 lag 假设出来的
-    # 拍摄时刻，拿它测时间差只会测出"假设的残差"（见 load_flight_stamps 与
-    # measure_frame_telemetry_lag 的说明）。capture 轴只用于互核。
-    baselines = [stamp.lag_s for stamp, _ in paired]
-    frames = [image for _, image in paired]
-    lag_baseline = baselines[0]
-    if max(baselines) - min(baselines) > 1e-6:
+    assert first_lag is not None
+    lag_baseline = first_lag
+    if max_lag - min_lag > 1e-6:
         LOGGER.warning(
-            "  素材里各帧记录的 lag 不一致（%.4f ~ %.4f）：互核基准取第一帧",
-            min(baselines),
-            max(baselines),
+            "  素材里各帧记录的 lag 不一致（%.4f ~ %.4f）：互核基准取第一可读帧",
+            min_lag,
+            max_lag,
         )
     LOGGER.info(
-        "共 %d 帧（时间轴 = received 收到时刻；录制时的 lag 基准 %.4f s）",
-        len(frames),
+        "分析 %d 帧（时间轴 = received；录制 lag 基准 %.4f s），其中 %d 帧有有效角点",
+        frame_count,
         lag_baseline,
+        len(observations),
     )
 
-    # ---- 步骤一 ----
     LOGGER.info("步骤一：内参标定")
-    intrinsics = run_intrinsics(frames, pattern_size=pattern_size, square_size=square_size)
+    intrinsics = run_intrinsics_from_corners(
+        [(observation.image_size, observation.corners) for observation in observations],
+        pattern_size=pattern_size,
+        square_size=square_size,
+    )
     LOGGER.info(
         "  视图 %d，重投影 RMS %.4f px，fx=%.1f fy=%.1f",
         intrinsics.views,
@@ -132,7 +159,6 @@ def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
         intrinsics.camera_matrix[1, 1],
     )
 
-    # ---- 步骤二 ----
     LOGGER.info("步骤二：画面-遥测时间差")
     board_points = board_object_points(pattern_size, square_size)
     board_rotations: list[np.ndarray] = []
@@ -140,32 +166,48 @@ def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
     pose_times_capture: list[float] = []
     board_poses: list[tuple[float, np.ndarray, np.ndarray]] = []
     rejected = 0
-    # 用 solve_board_poses 的单帧黑白相位判向：标定棋盘列行奇偶相反时，
-    # 正反候选相位相反；相同奇偶的尺寸会在该函数入口明确拒绝。
-    for stamp, pose in zip(
-        [record for record, _ in paired],
-        solve_board_poses(
-            frames,
+
+    frames_dir = flight_dir / "frames"
+    for observation in observations:
+        stamp = observation.stamp
+        filename = observation.filename
+        path = _frame_path(frames_dir, filename)
+        try:
+            encoded = np.fromfile(str(path), dtype=np.uint8)
+        except OSError as exc:
+            raise ValueError(f"位姿分析第二遍无法读取帧: {filename}") from exc
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"位姿分析第二遍无法解码帧: {filename}")
+        current_size = (int(image.shape[1]), int(image.shape[0]))
+        if current_size != observation.image_size:
+            raise ValueError(f"两遍分析间图像尺寸改变: {filename}")
+        digest = hashlib.sha256(memoryview(image).cast("B")).digest()
+        if digest != observation.image_digest:
+            raise ValueError(f"两遍分析间图像像素内容改变: {filename}")
+        pose = solve_board_pose(
+            image,
+            observation.corners,
             board_points,
             intrinsics.camera_matrix,
             intrinsics.dist_coeffs,
             pattern_size=pattern_size,
             square_size=square_size,
-        ),
-        strict=True,
-    ):
+        )
         if pose is None:
             rejected += 1
+            del image, encoded
             continue
         rvec, tvec = pose
         rotation, _ = cv2.Rodrigues(rvec)
         board_rotations.append(rotation)
-        pose_times.append(stamp.received_timestamp)  # 第 3 步配对也用 received 轴
+        pose_times.append(stamp.received_timestamp)
         pose_times_capture.append(stamp.capture_timestamp)
         board_poses.append((stamp.received_timestamp, rvec, tvec))
+        del image, encoded
+    del observations
     if rejected:
-        LOGGER.warning("  丢弃 %d 帧（角点检不出）", rejected)
-
+        LOGGER.warning("  丢弃 %d 帧（棋盘方向或相位判据未通过）", rejected)
     # BUG：合并快照 timestamp 不是四元数采样/接收时刻，会把其它字段更新延迟混入标定。
     timeline = SourceTimeline(telemetry_rows, include_position=False)
     telemetry_quality: dict[str, Any] = {"source_timeline": timeline.quality_meta}
@@ -279,7 +321,7 @@ def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
     )
     _log_translation_diagnostic(diagnostic)
 
-    return build_calibration_report(
+    report = build_calibration_report(
         intrinsics=intrinsics,
         lag=lag,
         measurement=measurement,
@@ -294,6 +336,15 @@ def calibrate(  # noqa: PLR0912 - 三步流水线保留清晰的失败分支
         telemetry_quality=telemetry_quality,
         translation_diagnostic=diagnostic,
     )
+    report["meta"]["frame_analysis"] = {
+        "recorded_frames": capture_quality["frame_count"] if capture_quality else None,
+        "analyzed_frames": frame_count,
+        "received_time_range_s": [first_received, last_received],
+        "intrinsic_views": intrinsics.views,
+        "pnp_poses": len(board_poses),
+        "max_frames": max_frames,
+    }
+    return report
 
 
 def _validate_full_update_capture(
@@ -352,44 +403,53 @@ def _validate_full_update_capture(
         )
 
     frames_path = flight_dir / "frames_index.jsonl"
-    frames = [
-        json.loads(line) for line in frames_path.read_text(encoding="utf-8").splitlines() if line
-    ]
-    if len(frames) != stopped.get("frames_written") or len(frames) < 2:
-        raise ValueError("标定帧索引与 recorder_stopped 统计不一致，或有效帧不足")
     import cv2  # 惰性导入：完整性检查只在离线标定时加载 OpenCV
 
-    frame_times: list[float] = []
+    frame_count = 0
+    first_frame_time: float | None = None
+    last_frame_time: float | None = None
     frames_dir = flight_dir / "frames"
-    for item in frames:
-        try:
-            timestamp = float(item["received_timestamp"])
-            filename = str(item["filename"])
-            expected_bytes = int(item["bytes"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("标定帧索引缺少有效时间戳、文件名或字节数") from exc
-        if not math.isfinite(timestamp) or (frame_times and timestamp <= frame_times[-1]):
-            raise ValueError("标定帧接收时间戳必须有限且严格递增")
-        try:
-            path = _frame_path(frames_dir, filename)
-        except ValueError as exc:
-            raise ValueError(f"标定帧索引包含非法文件名: {filename}") from exc
-        try:
-            encoded = path.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"标定帧文件缺失或不可读: {filename}") from exc
-        if (
-            len(encoded) != expected_bytes
-            or cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR) is None
-        ):
-            raise ValueError(f"标定帧文件长度不符或无法解码: {filename}")
-        frame_times.append(timestamp)
-    span = frame_times[-1] - frame_times[0]
+    with frames_path.open(encoding="utf-8") as frame_file:
+        for line_number, line in enumerate(frame_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                timestamp = float(item["received_timestamp"])
+                filename = str(item["filename"])
+                expected_bytes = int(item["bytes"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"标定帧索引第 {line_number} 行缺少有效时间戳、文件名或字节数"
+                ) from exc
+            if not math.isfinite(timestamp) or (
+                last_frame_time is not None and timestamp <= last_frame_time
+            ):
+                raise ValueError("标定帧接收时间戳必须有限且严格递增")
+            try:
+                path = _frame_path(frames_dir, filename)
+            except ValueError as exc:
+                raise ValueError(f"标定帧索引包含非法文件名: {filename}") from exc
+            try:
+                encoded = path.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"标定帧文件缺失或不可读: {filename}") from exc
+            image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if len(encoded) != expected_bytes or image is None:
+                raise ValueError(f"标定帧文件长度不符或无法解码: {filename}")
+            del image, encoded
+            first_frame_time = timestamp if first_frame_time is None else first_frame_time
+            last_frame_time = timestamp
+            frame_count += 1
+    if frame_count != stopped.get("frames_written") or frame_count < 2:
+        raise ValueError("标定帧索引与 recorder_stopped 统计不一致，或有效帧不足")
+    assert first_frame_time is not None and last_frame_time is not None
+    span = last_frame_time - first_frame_time
     return {
         "scope": "process_accepted_samples",
         "telemetry": counts,
-        "frame_count": len(frames),
-        "frame_hz": (len(frames) - 1) / span,
+        "frame_count": frame_count,
+        "frame_hz": (frame_count - 1) / span,
     }
 
 
@@ -406,8 +466,8 @@ class CalibrateConfig:
     #: 时间差搜索范围与步长（秒）
     lag_search_s: float = LAG_SEARCH_S
     lag_step_s: float = LAG_STEP_S
-    #: 最多读取多少帧
-    max_frames: int = MAX_FRAMES
+    #: 可选的调试前缀帧数上限；默认分析完整采集
+    max_frames: int | None = MAX_FRAMES
     #: 严格模式：外参/时间差没标出来时返回非 0（默认只警告，照样写文件）
     strict: bool = STRICT
     source: CalibrationSource = "measured_calibration"

@@ -8,7 +8,8 @@ OpenCV 5.0 的全部易错点与判据。修改标定逻辑、改 `georef` 外�
 - **`airdrop_calibration/calibrate.py` = 三步标定流水线**（内参 → 画面/遥测时间差 →
   手眼外参）。代码与合成数据的回归契约见 `tests/test_calibrate.py`；它覆盖整个
   `calibrate()` 输出，包括 `t_bc` 使用尺量值以及独立的 `meta.translation_diagnostic`。
-  这些合成回归不代表真实素材标定精度；真实素材复测仍未完成。
+  合成回归之外，同一份 96 帧完整输入还与 eager 参考结果逐项比较了内参、畸变、旋转、延迟和平移；这一离线对照不替代实机采集验证。
+  - **完整采集与内存**：默认逐帧扫描完整索引，首遍只缓存亚像素角点、时间戳、尺寸与像素摘要；内参使用所有有效视图联合求解，第二遍只重读有效视图做相位和 PnP。完整性检查、首遍和第二遍均不保留图像集合。两遍间解码像素发生变化会明确失败。`--max-frames N` 仅用于截取索引前缀调试。
   - **OpenCV API先检查实际安装包**：绑定缺失、输入类型不符和模块变更是不同问题。使用前检查`hasattr(cv2, "calibrateHandEye")`并执行最小几何调用，不能根据问题关闭或版本号推断当前wheel已可用。
     某些OpenCV 5.0 Python构建缺失手眼绑定，历史原因见官方[issue #29565](https://github.com/opencv/opencv/issues/29565)。本工具保留自研`solve_hand_eye`及同一`A X = X B`约定；替换后端需要独立数值回归，不能靠安装contrib包代替API验证。
   - **手眼的方程与来源（唯一正确写法）**：棋盘格固定在 `C = T_world_board`，

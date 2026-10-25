@@ -1,7 +1,7 @@
 """与飞行运行包分离的离线相机标定工具。"""
 
 from .flight_log import (
-    load_flight_frames_paired,
+    iter_flight_frames_paired,
     load_flight_index,
     load_flight_stamps,
     load_flight_telemetry,
@@ -29,7 +29,7 @@ __all__ = [
     "Telemetry",
     "TelemetryLike",
     "build_calibration_report",
-    "load_flight_frames_paired",
+    "iter_flight_frames_paired",
     "load_flight_index",
     "load_flight_stamps",
     "load_flight_telemetry",

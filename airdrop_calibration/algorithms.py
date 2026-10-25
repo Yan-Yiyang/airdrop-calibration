@@ -20,7 +20,6 @@ from .settings import (
     LAG_SEARCH_S,
     LAG_STEP_S,
     MAX_MOTION_PAIRS,
-    MAX_VIEWS,
     MIN_AXIS_SPREAD_DEG,
     MIN_PAIR_ROTATION_DEG,
     MIN_VIEWS,
@@ -178,6 +177,55 @@ def _pattern_phase_quality(
     return score / len(samples), contrast, len(samples)
 
 
+def solve_board_pose(
+    image: np.ndarray,
+    corners: np.ndarray | None,
+    object_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    *,
+    pattern_size: tuple[int, int] = PATTERN_SIZE,
+    square_size: float = SQUARE_SIZE_M,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """用已检测角点判定棋盘格方向并解单帧位姿。"""
+    import cv2
+
+    cols, rows = pattern_size
+    if (cols - rows) % 2 == 0:
+        raise ValueError("棋盘格内角点列数与行数必须一奇一偶，才能用单帧黑白相位判定方向")
+    if corners is None:
+        return None
+    candidates: list[tuple[float, np.ndarray, np.ndarray]] = []
+    for candidate_corners in (corners, corners[::-1]):
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            candidate_corners,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_IPPE,
+        )
+        if ok:
+            score, contrast, samples = _pattern_phase_quality(
+                image,
+                rvec,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                pattern_size=pattern_size,
+                square_size=square_size,
+            )
+            if samples >= 8 and contrast >= 25.0:
+                candidates.append((score, rvec, tvec))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if candidates[0][0] < 0.8 or (
+        len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.5
+    ):
+        return None
+    return candidates[0][1], candidates[0][2]
+
+
 def solve_board_poses(
     images: Sequence[np.ndarray],
     object_points: np.ndarray,
@@ -187,55 +235,24 @@ def solve_board_poses(
     pattern_size: tuple[int, int] = PATTERN_SIZE,
     square_size: float = SQUARE_SIZE_M,
 ) -> list[tuple[np.ndarray, np.ndarray] | None]:
-    """逐帧检测 + 解位姿；用黑白格心相位选择唯一角点方向。
-
-    内角点列/行同奇偶时，反序映射不改变内部方格相位，单帧图像无法选择方向，故拒绝。
-    奇偶相反时，反序会翻转相位；只接受样本足够、对比度足够且恰有一个候选匹配的帧。
-
-    返回与 ``images`` 等长的列表，检不出角点的位置为 ``None``。
-    """
-    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
-
+    """逐帧检测并解位姿；相位质量与方向判据见 ``solve_board_pose``。"""
     cols, rows = pattern_size
     if (cols - rows) % 2 == 0:
         raise ValueError("棋盘格内角点列数与行数必须一奇一偶，才能用单帧黑白相位判定方向")
-    poses: list[tuple[np.ndarray, np.ndarray] | None] = []
+    poses = []
     for image in images:
         corners = detect_corners(image, pattern_size)
-        if corners is None:
-            poses.append(None)
-            continue
-        candidates: list[tuple[float, np.ndarray, np.ndarray]] = []
-        for candidate_corners in (corners, corners[::-1]):
-            ok, rvec, tvec = cv2.solvePnP(
+        poses.append(
+            solve_board_pose(
+                image,
+                corners,
                 object_points,
-                candidate_corners,
                 camera_matrix,
                 dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE,
+                pattern_size=pattern_size,
+                square_size=square_size,
             )
-            if ok:
-                score, contrast, samples = _pattern_phase_quality(
-                    image,
-                    rvec,
-                    tvec,
-                    camera_matrix,
-                    dist_coeffs,
-                    pattern_size=pattern_size,
-                    square_size=square_size,
-                )
-                if samples >= 8 and contrast >= 25.0:
-                    candidates.append((score, rvec, tvec))
-        if not candidates:
-            poses.append(None)
-            continue
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        if candidates[0][0] < 0.8 or (
-            len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.5
-        ):
-            poses.append(None)
-            continue
-        poses.append((candidates[0][1], candidates[0][2]))
+        )
     return poses
 
 
@@ -436,55 +453,40 @@ def _base_look_down_pose(
     return rvec.reshape(3), tvec.reshape(3, 1)
 
 
-def run_intrinsics(
-    frames: Sequence[np.ndarray],
+def run_intrinsics_from_corners(
+    observations: Sequence[tuple[tuple[int, int], np.ndarray]],
     *,
     pattern_size: tuple[int, int] = PATTERN_SIZE,
     square_size: float = SQUARE_SIZE_M,
     min_views: int = MIN_VIEWS,
-    max_views: int = MAX_VIEWS,
 ) -> IntrinsicsResult:
-    """棋盘格多视图内参标定。
+    """用完整的角点观测集合执行一次内参联合求解。"""
+    import cv2
 
-    ⚠ **OpenCV 5.0 的 ``calibrateCamera`` 只收 float32 的 objectPoints/imagePoints**
-    （实测：任一为 float64 都抛 ``objectPoints should contain vector of vectors of
-    points of type Point3f``）。而 :func:`detect_corners` 的 SB 路径给的是 float64，
-    所以这里必须显式转 float32——不转的话内参这步会直接失败。
-    """
-    import cv2  # 惰性导入：重依赖，只在真正做标定时加载（见模块 docstring）
-
-    object_points: list[np.ndarray] = []
-    image_points: list[np.ndarray] = []
-    size: tuple[int, int] | None = None
-    board = board_object_points(pattern_size, square_size).astype(np.float32)
-
-    for frame in frames:
-        if size is None:
-            size = (int(frame.shape[1]), int(frame.shape[0]))
-        corners = detect_corners(frame, pattern_size)
-        if corners is None:
-            continue
-        object_points.append(board.copy())
-        image_points.append(corners.astype(np.float32))
-        if len(object_points) >= max_views:
-            break
-
-    if size is None:
-        raise ValueError("没有任何图像帧")
-    if len(object_points) < max(3, min_views):
+    if not observations:
         raise ValueError(
-            f"有效视图不足：找到 {len(object_points)} 个（至少需要 {max(3, min_views)} 个）。"
+            f"有效视图不足：找到 0 个（至少需要 {max(3, min_views)} 个）。"
             "检查棋盘格内角点数 PATTERN_SIZE 是否与实际板子一致，以及棋盘格是否全程可见"
         )
-
+    sizes = {size for size, _ in observations}
+    if len(sizes) != 1:
+        raise ValueError("标定图像尺寸不一致，不能混合求解")
+    size = next(iter(sizes))
+    board = board_object_points(pattern_size, square_size).astype(np.float32)
+    object_points = [board.copy() for _ in observations]
+    image_points = [corners.astype(np.float32) for _, corners in observations]
+    if len(image_points) < max(3, min_views):
+        raise ValueError(
+            f"有效视图不足：找到 {len(image_points)} 个（至少需要 {max(3, min_views)} 个）。"
+            "检查棋盘格内角点数 PATTERN_SIZE 是否与实际板子一致，以及棋盘格是否全程可见"
+        )
     rms, matrix, dist, rvecs, tvecs = cv2.calibrateCamera(
         object_points, image_points, size, None, None
     )
-    per_view: list[float] = []
+    per_view = []
     for index, (obj, img) in enumerate(zip(object_points, image_points, strict=True)):
         projected, _ = cv2.projectPoints(obj, rvecs[index], tvecs[index], matrix, dist)
-        error = float(np.sqrt(np.mean(np.sum((projected - img) ** 2, axis=2))))
-        per_view.append(error)
+        per_view.append(float(np.sqrt(np.mean(np.sum((projected - img) ** 2, axis=2)))))
     return IntrinsicsResult(
         camera_matrix=np.asarray(matrix, dtype=np.float64),
         dist_coeffs=np.asarray(dist, dtype=np.float64).reshape(-1),
@@ -492,6 +494,27 @@ def run_intrinsics(
         rms=float(rms),
         views=len(object_points),
         per_view_errors=per_view,
+    )
+
+
+def run_intrinsics(
+    frames: Sequence[np.ndarray],
+    *,
+    pattern_size: tuple[int, int] = PATTERN_SIZE,
+    square_size: float = SQUARE_SIZE_M,
+    min_views: int = MIN_VIEWS,
+) -> IntrinsicsResult:
+    """检测所有图像中的角点，并联合求解相机内参。"""
+    observations = []
+    for frame in frames:
+        corners = detect_corners(frame, pattern_size)
+        if corners is not None:
+            observations.append(((int(frame.shape[1]), int(frame.shape[0])), corners))
+    return run_intrinsics_from_corners(
+        observations,
+        pattern_size=pattern_size,
+        square_size=square_size,
+        min_views=min_views,
     )
 
 
@@ -827,8 +850,19 @@ def _rotation_axis(rotation: np.ndarray) -> np.ndarray:
 def _motion_pairs(count: int, max_pairs: int) -> list[tuple[int, int]]:
     if max_pairs < 1:
         raise ValueError("max_pairs 必须大于零")
-    pairs = [(index, other) for index in range(count) for other in range(index + 1, count)]
-    return pairs[:: len(pairs) // max_pairs + 1] if len(pairs) > max_pairs else pairs
+    total = count * (count - 1) // 2
+    stride = total // max_pairs + 1 if total > max_pairs else 1
+    pairs: list[tuple[int, int]] = []
+    row = 0
+    row_rank_start = 0
+    row_rank_end = count - 1
+    for rank in range(0, total, stride):
+        while rank >= row_rank_end:
+            row += 1
+            row_rank_start = row_rank_end
+            row_rank_end += count - row - 1
+        pairs.append((row, row + 1 + rank - row_rank_start))
+    return pairs
 
 
 def _axis_spread_deg(axes: Sequence[np.ndarray]) -> float:

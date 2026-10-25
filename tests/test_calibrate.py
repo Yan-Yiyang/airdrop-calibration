@@ -263,6 +263,41 @@ def test_intrinsics_needs_enough_views() -> None:
         run_intrinsics(blank, pattern_size=PATTERN, square_size=SQUARE, min_views=5)
 
 
+def test_intrinsics_uses_more_than_sixty_cached_views() -> None:
+    """完整采集视图都进入一次联合内参求解，不再截到旧上限。"""
+    from airdrop_calibration.algorithms import run_intrinsics_from_corners
+
+    frames, _ = _render_views(65)
+    observations = []
+    for frame in frames:
+        corners = detect_corners(frame, PATTERN)
+        assert corners is not None
+        assert corners.dtype == np.float64
+        observations.append((TRUE_SIZE, corners))
+    result = run_intrinsics_from_corners(
+        observations, pattern_size=PATTERN, square_size=SQUARE, min_views=5
+    )
+    assert result.views == 65
+    assert result.camera_matrix[0, 0] == pytest.approx(TRUE_FX, rel=0.02)
+    assert result.camera_matrix[1, 1] == pytest.approx(TRUE_FY, rel=0.02)
+
+
+def test_motion_pair_sampling_preserves_order_without_quadratic_candidates() -> None:
+    """抽样仍等价于旧字典序步长，同时大 N 不先构造全部配对。"""
+    from airdrop_calibration.algorithms import _motion_pairs as sampled_pairs
+
+    for count in range(16):
+        all_pairs = [
+            (first, second) for first in range(count) for second in range(first + 1, count)
+        ]
+        for maximum in (1, 2, 8, 2_000):
+            stride = len(all_pairs) // maximum + 1 if len(all_pairs) > maximum else 1
+            assert sampled_pairs(count, maximum) == all_pairs[::stride]
+    large_pairs = sampled_pairs(100_000, 2_000)
+    assert len(large_pairs) <= 2_000
+    assert large_pairs[0] == (0, 1)
+
+
 def test_detect_corners_finds_rendered_board() -> None:
     frames, _ = _render_views(1)
     corners = detect_corners(frames[0], PATTERN)
@@ -280,7 +315,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
     但 ``frames[k]`` 配的是另一行的时刻——实测造成 0.2s 错位，Δt 与手眼外参
     全建立在错配上，产出一份看起来正常的错误 ``camera_calib.json``。
     """
-    from airdrop_calibration.flight_log import load_flight_frames_paired, load_flight_index
+    from airdrop_calibration.flight_log import iter_flight_frames_paired, load_flight_index
 
     flight = workdir / "flight"
     (flight / "frames").mkdir(parents=True)
@@ -310,9 +345,9 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
     (flight / "frames_index.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     truth = {100.0 + i * 0.1: i for i in range(count)}
-    paired = load_flight_frames_paired(flight, limit=5)
+    paired = list(iter_flight_frames_paired(flight, limit=5))
     assert len(paired) == 5
-    for record, image in paired:
+    for record, filename, image in paired:
         assert image is not None
         # 这一帧的真实索引行必须与它带的时刻一致
         expected_row = truth[record.received_timestamp]
@@ -326,7 +361,7 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
         assert record.capture_timestamp == pytest.approx(record.received_timestamp)
 
     # 索引里解不出的两行被连同其时刻一起跳过，而不是留下空洞
-    assert [round(record.received_timestamp, 3) for record, _ in paired] == [
+    assert [round(record.received_timestamp, 3) for record, _, _ in paired] == [
         100.0,
         100.1,
         100.4,
@@ -334,6 +369,31 @@ def test_load_flight_frames_keeps_each_image_paired_with_its_own_timestamp(
         100.6,
     ]
     assert len(load_flight_index(flight)) == count
+
+
+def test_flight_index_default_reads_beyond_200_and_limit_counts_records(
+    workdir: Path,
+) -> None:
+    """帧时间辅助接口默认读完整索引，显式限制只计非空记录。"""
+    from airdrop_calibration.flight_log import load_flight_timestamps
+
+    flight = workdir / "long-index"
+    flight.mkdir()
+    rows = [
+        json.dumps(
+            {
+                "filename": f"{index:06d}.jpg",
+                "capture_timestamp": float(index),
+                "received_timestamp": float(index) + 0.1,
+            }
+        )
+        for index in range(205)
+    ]
+    (flight / "frames_index.jsonl").write_text("\n" + "\n\n".join(rows) + "\n", encoding="utf-8")
+    timestamps = load_flight_timestamps(flight)
+    assert len(timestamps) == 205
+    assert timestamps[-1] == pytest.approx(204.1)
+    assert load_flight_timestamps(flight, limit=2) == pytest.approx([0.1, 1.1])
 
 
 def test_flight_index_time_bases_and_missing_received(workdir: Path) -> None:
@@ -1095,6 +1155,7 @@ def _write_calibration_flight(
     telemetry_delay_s: float = 0.0,
     pattern_size: tuple[int, int] = PATTERN,
     position_available: bool = True,
+    blank_prefix: int = 0,
 ) -> None:
     """手写一个可标定的飞行目录（渲染棋盘格帧 + 与之自洽的遥测）。
 
@@ -1123,12 +1184,13 @@ def _write_calibration_flight(
     entries: list[tuple[float, np.ndarray]] = []
 
     for index in range(count):
+        pose_index = max(0, index - blank_prefix)
         rvec, tvec = look_at_board(
             0.55,
             true_camera_matrix(),
-            tilt_deg=15.0 * math.sin(index * 0.9),
-            yaw_deg=12.0 * math.cos(index * 0.6),
-            rim_roll_deg=10.0 * math.sin(index * 1.7),
+            tilt_deg=15.0 * math.sin(pose_index * 0.9),
+            yaw_deg=12.0 * math.cos(pose_index * 0.6),
+            rim_roll_deg=10.0 * math.sin(pose_index * 1.7),
             pattern_size=pattern_size,
             square_size=SQUARE,
         )
@@ -1141,6 +1203,8 @@ def _write_calibration_flight(
             pattern_size=pattern_size,
             square_size=SQUARE,
         )
+        if index < blank_prefix:
+            image = np.zeros_like(image)
         name = f"{index:06d}.jpg"
         ok, buffer = cv2.imencode(".jpg", image)
         assert ok
@@ -1211,6 +1275,150 @@ def _write_calibration_flight(
             )
         )
     (flight_dir / "telemetry.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_calibration_default_covers_frames_after_old_200_frame_prefix(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """完整性、检测和位姿三阶段图像驻留峰值保持常数级。"""
+    import weakref
+
+    flight_dir = workdir / "late-boards"
+    count = 225
+    _write_calibration_flight(
+        flight_dir, count=count, pattern_size=ORIENTABLE_PATTERN, blank_prefix=201
+    )
+    telemetry_count = count + 2
+    (flight_dir / "config_snapshot.json").write_text(
+        json.dumps({"record": {"telemetry_hz": 0}}), encoding="utf-8"
+    )
+    stopped = {
+        "kind": "recorder_stopped",
+        "telemetry_received": telemetry_count,
+        "telemetry_enqueued": telemetry_count,
+        "telemetry_written": telemetry_count,
+        "telemetry_dropped": 0,
+        "telemetry_write_errors": 0,
+        "telemetry_pending": 0,
+        "frame_encode_errors": 0,
+        "finalize_errors": 0,
+        "frames_skipped": 0,
+        "frames_written": count,
+        "events": 0,
+    }
+    (flight_dir / "events.jsonl").write_text(json.dumps(stopped) + "\n", encoding="utf-8")
+
+    live_images: list[weakref.ReferenceType[np.ndarray]] = []
+    peak_live = 0
+    decode_calls = detect_calls = pose_calls = phase_calls = 0
+
+    def sample() -> None:
+        nonlocal peak_live
+        peak_live = max(peak_live, sum(reference() is not None for reference in live_images))
+
+    original_decode = cv2.imdecode
+    original_detect = calibrate_module.detect_corners
+    original_pose = calibrate_module.solve_board_pose
+    from airdrop_calibration import algorithms as algorithms_module
+
+    original_phase = algorithms_module._pattern_phase_quality
+
+    def track_decode(encoded: np.ndarray, flags: int) -> np.ndarray | None:
+        nonlocal decode_calls
+        decode_calls += 1
+        image = original_decode(encoded, flags)
+        if image is not None:
+            live_images.append(weakref.ref(image))
+            sample()
+        return image
+
+    def track_detect(image: np.ndarray, pattern_size: tuple[int, int]) -> np.ndarray | None:
+        nonlocal detect_calls
+        detect_calls += 1
+        sample()
+        return original_detect(image, pattern_size)
+
+    def track_pose(
+        image: np.ndarray,
+        corners: np.ndarray | None,
+        object_points: np.ndarray,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        *,
+        pattern_size: tuple[int, int],
+        square_size: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        nonlocal pose_calls
+        pose_calls += 1
+        sample()
+        return original_pose(
+            image,
+            corners,
+            object_points,
+            camera_matrix,
+            dist_coeffs,
+            pattern_size=pattern_size,
+            square_size=square_size,
+        )
+
+    def track_phase(
+        image: np.ndarray,
+        rvec: np.ndarray,
+        tvec: np.ndarray,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        *,
+        pattern_size: tuple[int, int],
+        square_size: float,
+    ) -> tuple[float, float, int]:
+        nonlocal phase_calls
+        phase_calls += 1
+        sample()
+        return original_phase(
+            image,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+            pattern_size=pattern_size,
+            square_size=square_size,
+        )
+
+    monkeypatch.setattr(cv2, "imdecode", track_decode)
+    monkeypatch.setattr(calibrate_module, "detect_corners", track_detect)
+    monkeypatch.setattr(calibrate_module, "solve_board_pose", track_pose)
+    monkeypatch.setattr(algorithms_module, "_pattern_phase_quality", track_phase)
+    result = calibrate(flight_dir, pattern_size=ORIENTABLE_PATTERN)
+    frame_meta = result["meta"]["frame_analysis"]
+    assert frame_meta["analyzed_frames"] == count
+    assert frame_meta["intrinsic_views"] == 24
+    assert result["camera_matrix"] is not None
+    assert decode_calls == count * 2 + 24  # 完整性、首遍检测、有效视图 PnP
+    assert detect_calls == count
+    assert pose_calls == 24
+    assert phase_calls > 0
+    assert peak_live <= 2
+
+
+def test_calibration_rejects_same_size_image_changed_between_passes(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第二遍不得把首遍角点与后来替换的同尺寸图像混合求解。"""
+    flight_dir = workdir / "changed-between-passes"
+    _write_calibration_flight(
+        flight_dir, count=16, pattern_size=ORIENTABLE_PATTERN, position_available=False
+    )
+    original_solve = calibrate_module.run_intrinsics_from_corners
+
+    def replace_after_intrinsics(observations, **kwargs):
+        result = original_solve(observations, **kwargs)
+        changed = np.full((TRUE_SIZE[1], TRUE_SIZE[0], 3), 240, dtype=np.uint8)
+        assert cv2.imwrite(str(flight_dir / "frames" / "000000.jpg"), changed)
+        return result
+
+    monkeypatch.setattr(calibrate_module, "run_intrinsics_from_corners", replace_after_intrinsics)
+    with pytest.raises(ValueError, match="两遍分析间图像像素内容改变"):
+        calibrate(flight_dir, pattern_size=ORIENTABLE_PATTERN)
 
 
 def test_calibrate_payload_records_lever_arm_against_measured_value(

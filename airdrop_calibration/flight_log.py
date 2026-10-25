@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -27,34 +28,39 @@ def _stamp_value(stamp: FrameStamp, time_base: str) -> float:
     )
 
 
-def _read_flight_index(flight_dir: Path, limit: int | None) -> list[tuple[FrameStamp, str]]:
-    """一次遍历读取帧时间与相对文件名；标定必须有 received 时间戳。"""
+def _read_flight_index(flight_dir: Path, limit: int | None):
+    """逐行读取帧索引，避免同时复制完整 JSONL 文本与记录列表。"""
     index_path = flight_dir / "frames_index.jsonl"
     if not index_path.is_file():
         raise FileNotFoundError(f"缺少帧索引: {index_path}")
-    entries: list[tuple[FrameStamp, str]] = []
-    for line in index_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        record = json.loads(line)
-        if not isinstance(record, dict):
-            raise ValueError(f"帧索引记录必须是对象（{index_path} 第 {len(entries) + 1} 行）")
-        if "received_timestamp" not in record:
-            raise ValueError(
-                f"帧索引缺少 received_timestamp（{index_path} 第 {len(entries) + 1} 行）："
-                "标定第 2/3 步要用收到时刻这个原始量，不能拿 capture_timestamp 顶替。"
-                "旧素材可显式用 load_flight_index(..., time_base='capture') 诊断。"
+    if limit is not None and (isinstance(limit, bool) or limit < 1):
+        raise ValueError("limit 必须是正整数或 None")
+    record_count = 0
+    with index_path.open(encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"帧索引记录必须是对象（{index_path} 第 {line_number} 行）")
+            if "received_timestamp" not in record:
+                raise ValueError(
+                    f"帧索引缺少 received_timestamp（{index_path} 第 {line_number} 行）："
+                    "标定第 2/3 步要用收到时刻这个原始量，不能拿 capture_timestamp 顶替。"
+                    "旧素材可显式用 load_flight_index(..., time_base='capture') 诊断。"
+                )
+            stamp = FrameStamp(
+                received_timestamp=_finite_number(
+                    record["received_timestamp"], "received_timestamp"
+                ),
+                capture_timestamp=_finite_number(record["capture_timestamp"], "capture_timestamp"),
+                lag_s=_finite_number(record.get("lag", 0.0), "lag"),
             )
-        stamp = FrameStamp(
-            received_timestamp=_finite_number(record["received_timestamp"], "received_timestamp"),
-            capture_timestamp=_finite_number(record["capture_timestamp"], "capture_timestamp"),
-            lag_s=_finite_number(record.get("lag", 0.0), "lag"),
-        )
-        entries.append((stamp, str(record["filename"])))
-        if limit is not None and len(entries) >= limit:
-            break
-    return entries
+            record_count += 1
+            yield stamp, str(record["filename"])
+            if limit is not None and record_count >= limit:
+                break
 
 
 def _finite_number(value: Any, name: str) -> float:
@@ -99,15 +105,16 @@ def _frame_path(frames_dir: Path, name: str) -> Path:
     return candidate
 
 
-def load_flight_frames_paired(
-    flight_dir: Path, limit: int = 200
-) -> list[tuple[FrameStamp, np.ndarray]]:
-    """读取帧并与产生它的同一索引记录配对；缺失或坏图像连同时间一起跳过。"""
+def iter_flight_frames_paired(
+    flight_dir: Path, limit: int | None = None
+) -> Iterator[tuple[FrameStamp, str, np.ndarray]]:
+    """逐帧读取图像并返回同一索引记录的时间戳、名称和图像。"""
     import cv2
 
+    if limit is not None and limit < 1:
+        raise ValueError("limit 必须是正整数或 None")
     frames_dir = flight_dir / "frames"
-    paired: list[tuple[FrameStamp, np.ndarray]] = []
-    skipped = 0
+    skipped = decoded = 0
     for stamp, name in _read_flight_index(flight_dir, None):
         path = _frame_path(frames_dir, name)
         if not path.is_file():
@@ -117,15 +124,12 @@ def load_flight_frames_paired(
         if image is None:
             skipped += 1
             continue
-        paired.append((stamp, image))
-        if len(paired) >= limit:
+        decoded += 1
+        yield stamp, name, image
+        if limit is not None and decoded >= limit:
             break
     if skipped:
-        LOGGER.warning(
-            "帧索引里有 %d 帧缺失或解不出（已连同其时间记录一起跳过）",
-            skipped,
-        )
-    return paired
+        LOGGER.warning("帧索引里有 %d 帧缺失或解不出（已连同其时间记录一起跳过）", skipped)
 
 
 def load_flight_telemetry(flight_dir: Path) -> list[Telemetry]:
@@ -161,7 +165,7 @@ def load_flight_telemetry(flight_dir: Path) -> list[Telemetry]:
 
 def load_flight_timestamps(
     flight_dir: Path,
-    limit: int = 200,
+    limit: int | None = None,
     *,
     time_base: str = TIME_BASE_RECEIVED,
 ) -> list[float]:
